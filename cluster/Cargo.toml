@@ -1,0 +1,10 @@
+[package]
+name = "aetherflow-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Add dependencies specific to cluster here
+

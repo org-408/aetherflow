@@ -1,0 +1,9 @@
+[package]
+name = "capability-proof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Stage C: proves Rust's type system enforces actor isolation (iso) at compile time"
+
+# Detach from the parent (currently non-building) workspace so this proof is self-contained.
+[workspace]

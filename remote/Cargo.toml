@@ -1,0 +1,10 @@
+[package]
+name = "aetherflow-remote"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Add dependencies specific to remote here
+

@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "core",
+    # frozen stubs (roadmap: 将来の拡張レイヤー面。今は凍結)
+    "remote",
+    "cluster",
+    "persistence",
+    "streams",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["mash180sx <mash180sx@gmail.com>"]
+edition = "2021"
+rust-version = "1.81.0"
+description = "A high-performance thread-per-core actor runtime in Rust"
+documentation = "https://docs.rs/aetherflow"
+readme = "README.md"
+homepage = "https://github.com/org-408/aetherflow"
+repository = "https://github.com/org-408/aetherflow"
+license = "MIT OR Apache-2.0"
+keywords = ["actor", "concurrent", "thread-per-core", "low-latency"]
+categories = ["concurrency", "asynchronous"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+opt-level = 0
+debug = true
+
+[profile.bench]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+
+[workspace.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

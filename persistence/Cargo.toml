@@ -1,0 +1,10 @@
+[package]
+name = "aetherflow-persistence"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Add dependencies specific to persistence here
+

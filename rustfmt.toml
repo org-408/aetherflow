@@ -1,0 +1,56 @@
+# Use 4 spaces for indentation
+tab_spaces = 4
+
+# Maximum width of each line
+max_width = 100
+
+# Use field initialize shorthand if possible
+use_field_init_shorthand = true
+
+# Merge imports
+merge_imports = true
+
+# Reorder imports
+reorder_imports = true
+
+# Reorder modules
+reorder_modules = true
+
+# Format comments
+comment_width = 80
+
+# Format strings
+format_strings = true
+
+# Format macro invocations
+format_macro_matchers = true
+
+# Format macro bodies
+format_macro_bodies = true
+
+# Wrap comments
+wrap_comments = true
+
+# Prevent formatting of comments that begin with the specified string
+ignore_comments = []
+
+# Convert /* */ comments to // comments where possible
+normalize_comments = true
+
+# Format code snippets in doc comments
+format_code_in_doc_comments = true
+
+# Group imports by the specified order
+imports_granularity = "Module"
+
+# Where to put the `where` clause
+where_single_line = true
+
+# Use "Old" style of brackets for array types
+array_width = 60
+
+# Formatting of attribute macros on separate lines
+attr_fn_like_width = 70
+
+# Chain width for breaking
+chain_width = 60
