@@ -2,6 +2,75 @@
 
 > `direction-and-roadmap.md` #6 の勝負どころ。`core/benches/latency.rs` を走らせた記録と解釈。
 
+## ★★ 権威ある実測 v2: 総合力検証(2026-07-14)= tokio/kameo/kompact/glommio に**全分位で勝ち**
+
+比較相手を「同ジャンルの速い実装」まで広げた総合力検証。**AWS Graviton3 の実 Linux 2機**で実測:
+
+- **`c7g.large`** — 2 専有 vCPU / Ubuntu 24.04 / `taskset -c 0,1`(Tier1 = isolcpus 無しの通常起動)
+- **`c7g.metal`** — ベアメタル / IRQ をコア 0-1 から実行時に排除 / `taskset -c 0,1`(**isolcpus 無し**、下記「発見」を参照)
+
+`samples=200,000` / `warmup=20,000` / `throughput_n=2,000,000`、release + LTO。
+
+### ping-pong RTT (ns) — `c7g.metal`(ベアメタル)
+| runtime | p50 | p90 | p99 | p999 | jitter(p99/p50) |
+|---|--:|--:|--:|--:|--:|
+| **aether-spin** | **709** | **797** | **1195** | **4911** | 1.7 |
+| aether-backoff | 688 | 738 | 1035 | 4844 | 1.5 |
+| kompact | 4965 | 5394 | 6305 | 8731 | 1.3 |
+| tokio | 4325 | 6013 | 10992 | 12582 | 2.5 |
+| kameo | 6536 | 11158 | 11853 | 16161 | 1.8 |
+| glommio | 19043 | 19387 | 20971 | 22677 | 1.1 |
+
+### ping-pong RTT (ns) — `c7g.large`(専有 vCPU)
+| runtime | p50 | p90 | p99 | p999 | jitter(p99/p50) |
+|---|--:|--:|--:|--:|--:|
+| **aether-spin** | **575** | **879** | **979** | **3119** | 1.7 |
+| aether-backoff | 567 | 762 | 933 | 3144 | 1.6 |
+| kompact | 4769 | 5912 | 6801 | 10188 | 1.4 |
+| tokio | 5611 | 10148 | 10980 | 14332 | 2.0 |
+| kameo | 11661 | 11908 | 14030 | 16944 | 1.2 |
+| glommio | 20644 | 21029 | 24559 | 26764 | 1.2 |
+
+→ **全 percentile で全勝**。対 glommio は large で p50 36倍 / p99 25倍 / p999 8.6倍。
+
+### one-way throughput (msgs/sec)
+| runtime | c7g.metal | c7g.large |
+|---|--:|--:|
+| **aether** | **37,600,935** | **38,232,513** |
+| glommio | 21,855,834 | 24,699,078 |
+| kompact | 13,300,173 | 13,602,329 |
+| tokio | 6,918,156 | 6,993,581 |
+
+throughput は当初 Docker 上で glommio 13.8M > aether 12.6M と**負けていた**。core loop に **batch-drain**
+(1 actor 訪問あたり最大 `BATCH_DRAIN=128` 通を連続処理 = 制御ループのオーバーヘッド償却)を入れて逆転。
+※ trade-off あり: throughput ↔ 公平性(1 actor が最大 128 通ぶんコアを占有しうる)。将来 `SchedulingPolicy` で調整可能にする予定。
+
+### 決定的な発見: ping-pong の tail はベンチ側の park だった
+| aether-**ask** (ns) | p50 | p90 | p99 | **p999** | jitter |
+|---|--:|--:|--:|--:|--:|
+| c7g.metal | 335 | 379 | 393 | **396** | 1.2 |
+| c7g.large | 300 | 334 | 353 | **410** | 1.2 |
+
+- ping-pong の p999 が 4.9µs(metal)/ 3.1µs(large)に伸びるのは**ベンチの都合**:ping-pong は返信を std チャネルで受けるため
+  **メインスレッドが park/wake する**。その wake が tail を作っていた。
+- `ask` は完全ビジースピン(park 無し)= **ランタイム本来の経路**。その p999 は **396ns / 410ns = サブマイクロ秒**で、
+  large と metal で一貫。glommio の p999 22,677ns に対し **57倍**。
+- → **isolcpus は不要だった。** 絶対 tail に効いたのは「隔離コア」ではなく「park しない経路」。
+  (Tier2 で isolcpus を試みたが起動不良で失敗。だが上記のとおり**目的の数字は isolcpus 無しで達成済み**だった。)
+- 併せて: Docker 上で観測していた tail 暴発(13ms)は**仮想化 preempt が原因**と確定 ── 専有コアでは消えた。
+  busy-spin は専有コア前提、という前提条件が実ハードで裏づいた。
+
+### 但し書き(過大評価しないため)
+- **同条件ではない。** aether はビジースピン(低レイテンシ ↔ CPU を焼く)、tokio/kameo/glommio は park/wake。
+  これは設計思想の差であり、"完全に公平な同条件" は存在しない。代わりに **両者が自然な形**で測っている
+  (glommio は 2 executor + `shared_channel` の **cross-thread**。同一スレッド内比較のような細工はしていない)。
+- **これはメッセージパッシングの土俵。** glommio の本領は async I/O(io_uring)で、そこは**未測定 = 別土俵**。
+  「glommio に全部勝った」ではなく「**メッセージパッシングでは勝った**」が正しい主張。
+- `max` 列(表からは省略)は executor 起動時の初回コスト等を含み glommio で 1.8-2.7ms に跳ねる。参考値でしかない。
+- kameo は ask API しか持たないため、ping-pong 表の kameo 行は ask 表と同じ値。
+
+---
+
 ## ★ 権威ある実測: AWS 実 Linux(2026-07-04)= go/no-go は **GO**
 
 **AWS `c7g.large`(Graviton3 / aarch64 / 2 vCPU / Ubuntu 24.04、ネイティブ pin が効く実 Linux。
@@ -177,4 +246,4 @@ cd core && ./scripts/bench-linux.sh
 ## 関連
 - `competitive-landscape.md` — ベンチの的(相手・軸・North Star)
 - `core/benches/latency.rs` — 測定コード
-- `core/README.md` — ランタイム構成と既知の制約
+- `README.md` — ランタイム構成と既知の制約
