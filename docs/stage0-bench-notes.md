@@ -43,7 +43,8 @@
 
 throughput は当初 Docker 上で glommio 13.8M > aether 12.6M と**負けていた**。core loop に **batch-drain**
 (1 actor 訪問あたり最大 `BATCH_DRAIN=128` 通を連続処理 = 制御ループのオーバーヘッド償却)を入れて逆転。
-※ trade-off あり: throughput ↔ 公平性(1 actor が最大 128 通ぶんコアを占有しうる)。将来 `SchedulingPolicy` で調整可能にする予定。
+※ trade-off あり: throughput ↔ 公平性(1 actor が最大 128 通ぶんコアを占有しうる)。既定は 128 だが
+`System::with_policy(n, SchedulingPolicy::default().batch_drain(8))` で調整可能(`1` = 1 訪問 1 通 = 最も公平)。
 
 ### 決定的な発見: ping-pong の tail はベンチ側の park だった
 | aether-**ask** (ns) | p50 | p90 | p99 | **p999** | jitter |

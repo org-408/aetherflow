@@ -62,7 +62,7 @@ pub mod pinning;
 
 pub use ask::{AskError, Responder};
 pub use metrics::LatencySnapshot;
-pub use system::{ActorRef, IdleStrategy, RestartPolicy, SpawnBuilder, System};
+pub use system::{ActorRef, IdleStrategy, RestartPolicy, SchedulingPolicy, SpawnBuilder, System};
 
 /// 非ブロッキング送信 `try_send` の失敗理由。いずれも**元のメッセージを返す**ので、
 /// 呼び出し側は再ルーティング・永続化・ログ記録ができる。

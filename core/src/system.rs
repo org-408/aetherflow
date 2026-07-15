@@ -41,6 +41,64 @@ pub enum IdleStrategy {
     },
 }
 
+/// 1 actor 訪問あたりに連続処理する最大メッセージ数の既定値。
+/// 外側スケジューラループ(制御チャネル確認等)のオーバヘッドを償却して throughput を上げる。
+const DEFAULT_BATCH_DRAIN: usize = 128;
+
+/// コアスケジューラの調整ノブ。既定は低レイテンシ・高 throughput 寄り。
+///
+/// 単純な場合は `System::with_cores(n)` でよく、調整したい場合だけ opt-in する
+/// (progressive disclosure):
+///
+/// ```
+/// use aetherflow::{IdleStrategy, SchedulingPolicy, System};
+///
+/// // 共有環境向け: 譲る idle + 公平寄りの小さいバッチ
+/// let policy = SchedulingPolicy::default()
+///     .idle(IdleStrategy::backoff())
+///     .batch_drain(8);
+/// let sys = System::with_policy(1, policy);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SchedulingPolicy {
+    idle: IdleStrategy,
+    batch_drain: usize,
+}
+
+impl Default for SchedulingPolicy {
+    fn default() -> Self {
+        SchedulingPolicy {
+            idle: IdleStrategy::default(),
+            batch_drain: DEFAULT_BATCH_DRAIN,
+        }
+    }
+}
+
+impl SchedulingPolicy {
+    /// メッセージが無いときのコアスレッドの振る舞い。
+    pub fn idle(mut self, idle: IdleStrategy) -> Self {
+        self.idle = idle;
+        self
+    }
+
+    /// 1 actor 訪問あたりに連続処理する最大メッセージ数(バッチドレイン)。
+    ///
+    /// 大きいほど外側ループ(制御チャネル確認・actor 列の巡回)のオーバヘッドが償却されて
+    /// throughput が上がる。一方 1 actor が最大この通数ぶんコアを占有するため、同一コアに
+    /// 載る他 actor のレイテンシは悪化しうる ── **throughput ↔ 公平性のトレードオフ**。
+    ///
+    /// `1` = 「1 訪問につき 1 通」で最も公平。既定は `128`(throughput 寄り)。
+    /// 1 コアに 1 actor しか載せない構成なら公平性は問題にならないので、大きめでよい。
+    ///
+    /// # Panics
+    /// `n == 0` のとき(1 通も処理せず進捗しなくなるため)。
+    pub fn batch_drain(mut self, n: usize) -> Self {
+        assert!(n >= 1, "batch_drain must be >= 1 (0 would make no progress)");
+        self.batch_drain = n;
+        self
+    }
+}
+
 impl IdleStrategy {
     /// 共有/仮想化環境向けの無難なバックオフ。
     pub fn backoff() -> Self {
@@ -255,15 +313,21 @@ impl System {
         System::with_cores_idle(n, IdleStrategy::default())
     }
 
-    /// idle 戦略を指定してコアスレッドを立てる(各スレッドを論理コア 0..n に best-effort でピン留め)。
+    /// idle 戦略を指定してコアスレッドを立てる(他のノブは既定)。
     pub fn with_cores_idle(n: usize, idle: IdleStrategy) -> System {
+        System::with_policy(n, SchedulingPolicy::default().idle(idle))
+    }
+
+    /// スケジューリング方針を指定してコアスレッドを立てる
+    /// (各スレッドを論理コア 0..n に best-effort でピン留め)。
+    pub fn with_policy(n: usize, policy: SchedulingPolicy) -> System {
         assert!(n >= 1, "System needs at least 1 core");
         let mut cores = Vec::with_capacity(n);
         for core_index in 0..n {
             let (control, rx) = ctrl::channel::<Control>();
             let join = thread::Builder::new()
                 .name(format!("aether-core-{core_index}"))
-                .spawn(move || core_loop(core_index, rx, idle))
+                .spawn(move || core_loop(core_index, rx, policy))
                 .expect("spawn core thread");
             cores.push(CoreHandle {
                 control,
@@ -394,13 +458,8 @@ impl Drop for System {
     }
 }
 
-/// 1 actor 訪問あたりに連続処理する最大メッセージ数(バッチドレイン)。
-/// 外側スケジューラループ(制御チャネル確認等)のオーバヘッドを償却して throughput を上げる。
-/// 大きすぎると同一コアの他 actor の公平性が落ちるので上限を設ける。
-const BATCH_DRAIN: usize = 128;
-
 /// コアスレッドの本体。制御メッセージと actor 群を交互に捌く run-to-completion ループ。
-fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, idle: IdleStrategy) {
+fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, policy: SchedulingPolicy) {
     pinning::pin_current_thread_to(core_index); // best-effort(macOS は no-op)
     CURRENT_CORE.with(|c| c.set(Some(core_index))); // このスレッドの担当コアを記録(デッドロックガード用)
 
@@ -438,11 +497,12 @@ fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, idle: IdleStra
             match actors[i].poll_one() {
                 PollOutcome::Worked => {
                     did_work = true;
-                    // バッチドレイン: 同一 actor を最大 BATCH_DRAIN 通まで続けて処理し、
-                    // 外側ループ(制御チャネル try_recv 等)のオーバヘッドを 1/BATCH に償却する。
+                    // バッチドレイン: 同一 actor を最大 batch_drain 通まで続けて処理し、
+                    // 外側ループ(制御チャネル try_recv 等)のオーバヘッドを 1/batch に償却する。
+                    // 既に 1 通処理済みなので残りは batch_drain-1 通(=1 なら追加ドレイン無し)。
                     // パニック分離は維持(バッチ内でパニックしたら通常どおり切り離す)。
                     let mut panicked = false;
-                    for _ in 1..BATCH_DRAIN {
+                    for _ in 1..policy.batch_drain {
                         match actors[i].poll_one() {
                             PollOutcome::Worked => {}
                             PollOutcome::Empty => break,
@@ -503,7 +563,7 @@ fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, idle: IdleStra
         if did_work || ctrl_activity {
             idle_count = 0;
         } else {
-            idle.idle(idle_count);
+            policy.idle.idle(idle_count);
             idle_count = idle_count.saturating_add(1);
         }
     }

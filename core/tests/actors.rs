@@ -1,7 +1,8 @@
 //! ランタイム統合テスト: System → spawn → move 送信 → run-to-completion → shutdown。
 
 use aetherflow::{
-    Actor, ActorRef, AskError, Responder, RestartPolicy, SendError, System, TrySendError,
+    Actor, ActorRef, AskError, Responder, RestartPolicy, SchedulingPolicy, SendError, System,
+    TrySendError,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -470,4 +471,120 @@ fn round_robin_placement_runs() {
     let mut got: Vec<u32> = results.iter().collect();
     got.sort_unstable();
     assert_eq!(got, (0..9).collect::<Vec<_>>());
+}
+
+// ---- SchedulingPolicy(バッチドレイン)----
+
+/// `batch_drain(1)` = 1 訪問 1 通(バッチ無効)でも全メッセージが届く。
+/// バッチ長がメッセージ配送の正しさに影響しないことの確認。
+#[test]
+fn batch_drain_one_still_delivers_all() {
+    struct Counter {
+        out: mpsc::Sender<u32>,
+    }
+    impl Actor for Counter {
+        type Message = u32;
+        fn handle(&mut self, m: u32) {
+            self.out.send(m).unwrap();
+        }
+    }
+
+    let sys = System::with_policy(1, SchedulingPolicy::default().batch_drain(1));
+    let (out, rx) = mpsc::channel();
+    let addr = sys.spawn_on(0, Counter { out });
+    for i in 0..300u32 {
+        addr.send_blocking(i).unwrap();
+    }
+    let got: Vec<u32> = (0..300).map(|_| rx.recv().unwrap()).collect();
+    assert_eq!(got, (0..300).collect::<Vec<u32>>(), "順序込みで全件届くこと");
+}
+
+/// バッチ長がメッセージ数を超えても(300 通 < batch 1024)過剰ポーリングで壊れない。
+/// バッチは「空になったら抜ける」ので、上限に届かなくても正常終了する。
+#[test]
+fn batch_drain_larger_than_backlog_is_fine() {
+    struct Echo {
+        out: mpsc::Sender<u32>,
+    }
+    impl Actor for Echo {
+        type Message = u32;
+        fn handle(&mut self, m: u32) {
+            self.out.send(m).unwrap();
+        }
+    }
+
+    let sys = System::with_policy(1, SchedulingPolicy::default().batch_drain(1024));
+    let (out, rx) = mpsc::channel();
+    let addr = sys.spawn_on(0, Echo { out });
+    for i in 0..300u32 {
+        addr.send_blocking(i).unwrap();
+    }
+    for i in 0..300u32 {
+        assert_eq!(rx.recv().unwrap(), i);
+    }
+}
+
+/// **バッチの途中でパニックした actor だけを切り離し、同一コアの別 actor は生き続ける。**
+/// バッチドレインはパニック時に専用の分岐(バッチを抜けて切り離し)を通るので、
+/// 「バッチ内パニック」でも分離が壊れないことを退行検出する。
+#[test]
+fn panic_inside_batch_detaches_only_that_actor() {
+    struct Bomb {
+        seen: u32,
+    }
+    impl Actor for Bomb {
+        type Message = ();
+        fn handle(&mut self, _m: ()) {
+            self.seen += 1;
+            // バッチ(既定 128)の途中で爆発する = 1 通目ではない点が肝。
+            if self.seen == 5 {
+                panic!("boom mid-batch");
+            }
+        }
+    }
+    struct Survivor {
+        out: mpsc::Sender<u32>,
+    }
+    impl Actor for Survivor {
+        type Message = u32;
+        fn handle(&mut self, m: u32) {
+            self.out.send(m).unwrap();
+        }
+    }
+
+    // 同一コアに同居させる(バッチ内パニックが隣を巻き込まないことを見る)。
+    let sys = System::with_policy(1, SchedulingPolicy::default().batch_drain(128));
+    let (out, rx) = mpsc::channel();
+    let bomb = sys.spawn_on(0, Bomb { seen: 0 });
+    let survivor = sys.spawn_on(0, Survivor { out });
+
+    // 1 バッチに収まる量を積んでから爆発させる。
+    for _ in 0..20 {
+        let _ = bomb.try_send(());
+    }
+    // bomb が切り離される(consumer 消滅 → Closed)まで待つ。
+    let mut detached = false;
+    for _ in 0..10_000 {
+        if let Err(TrySendError::Closed(_)) = bomb.try_send(()) {
+            detached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(detached, "バッチ内でパニックした actor は切り離されること");
+
+    // 同一コアの隣人は無事で、以後も普通に処理を続ける。
+    for i in 0..50u32 {
+        survivor.send_blocking(i).unwrap();
+    }
+    for i in 0..50u32 {
+        assert_eq!(rx.recv().unwrap(), i, "隣の actor は巻き込まれないこと");
+    }
+}
+
+/// `batch_drain(0)` は進捗しなくなるので、設定時点で弾く(沈黙のハングにしない)。
+#[test]
+#[should_panic(expected = "batch_drain must be >= 1")]
+fn batch_drain_zero_is_rejected() {
+    let _ = SchedulingPolicy::default().batch_drain(0);
 }
