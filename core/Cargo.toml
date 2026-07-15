@@ -21,8 +21,11 @@ core_affinity = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 kameo = "0.21"
 # 総合力検証(P0)の比較相手: kompact = 高速 Rust MP(cross-platform)。
-# glommio(Linux 専用・本丸テスト)は Linux 環境で検証してから追加する(CI が Linux のため)。
 kompact = "0.11"
+
+# glommio = io_uring ベース(Linux 専用)。既製 thread-per-core + 薄 actor に対する本丸比較。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glommio = "0.9"
 
 [[bench]]
 name = "latency"

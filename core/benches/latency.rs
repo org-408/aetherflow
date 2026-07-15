@@ -310,8 +310,100 @@ mod kompact_bench {
     }
 }
 
+// ---- glommio: 既製 thread-per-core async(本丸)。公正のため cross-thread(2 executor)で測る。Linux 専用 ----------
+#[cfg(target_os = "linux")]
+mod glommio_bench {
+    use glommio::channels::shared_channel;
+    use glommio::{LocalExecutorBuilder, Placement};
+    use std::time::Instant;
+
+    /// 公正な cross-thread RTT: driver executor(core 1)→ worker executor(core 0)→ 返信。
+    /// glommio は cross-executor の park/wake を払う = aether-ask(busy-spin)と同じ土俵で比較。
+    pub fn pingpong() -> (u64, u64, u64, u64, u64) {
+        let (req_tx, req_rx) = shared_channel::new_bounded::<()>(2);
+        let (rep_tx, rep_rx) = shared_channel::new_bounded::<u64>(2);
+
+        let worker = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(move || async move {
+                let rx = req_rx.connect().await;
+                let tx = rep_tx.connect().await;
+                while rx.recv().await.is_some() {
+                    let _ = tx.send(1u64).await;
+                }
+            })
+            .expect("glommio worker spawn");
+
+        let driver = LocalExecutorBuilder::new(Placement::Fixed(1))
+            .spawn(move || async move {
+                let tx = req_tx.connect().await;
+                let rx = rep_rx.connect().await;
+                for _ in 0..super::WARMUP {
+                    let _ = tx.send(()).await;
+                    let _ = rx.recv().await;
+                }
+                let mut lat = Vec::with_capacity(super::SAMPLES);
+                for _ in 0..super::SAMPLES {
+                    let t0 = Instant::now();
+                    let _ = tx.send(()).await;
+                    let _ = rx.recv().await;
+                    lat.push(t0.elapsed().as_nanos() as u64);
+                }
+                lat
+            })
+            .expect("glommio driver spawn");
+
+        let mut lat = driver.join().expect("glommio driver join");
+        worker.join().expect("glommio worker join");
+        super::percentiles(&mut lat)
+    }
+
+    /// cross-thread one-way throughput: driver(core 1)→ worker(core 0)。
+    pub fn throughput() -> f64 {
+        let n = super::THROUGHPUT_N;
+        let (tx, rx) = shared_channel::new_bounded::<u64>(4096);
+        let (done_tx, done_rx) = shared_channel::new_bounded::<()>(1);
+
+        let worker = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(move || async move {
+                let rx = rx.connect().await;
+                let dtx = done_tx.connect().await;
+                let mut got = 0usize;
+                while rx.recv().await.is_some() {
+                    got += 1;
+                    if got == n {
+                        break;
+                    }
+                }
+                let _ = dtx.send(()).await;
+            })
+            .expect("glommio worker spawn");
+
+        let driver = LocalExecutorBuilder::new(Placement::Fixed(1))
+            .spawn(move || async move {
+                let tx = tx.connect().await;
+                let drx = done_rx.connect().await;
+                let t0 = Instant::now();
+                for i in 0..n {
+                    let _ = tx.send(i as u64).await;
+                }
+                let _ = drx.recv().await;
+                n as f64 / t0.elapsed().as_secs_f64()
+            })
+            .expect("glommio driver spawn");
+
+        let tp = driver.join().expect("glommio driver join");
+        worker.join().expect("glommio worker join");
+        tp
+    }
+}
+
 fn main() {
-    println!("# Stage 0 latency bench (macOS/no-pin — 相対シグナル。権威ある数字は Linux で)");
+    // ピン留めの実効性はプラットフォーム依存(Linux=sched_setaffinity、他=no-op)。
+    // ヘッダを固定文字列にすると Linux 実測でも "macOS" と印字され、貼り付けた出力が嘘になる。
+    #[cfg(target_os = "linux")]
+    println!("# Stage 0 latency bench (Linux — ネイティブなコアピン留めが有効。権威ある数字はここ)");
+    #[cfg(not(target_os = "linux"))]
+    println!("# Stage 0 latency bench (非 Linux — ピン留めは no-op、相対シグナルのみ。権威ある数字は Linux で)");
     println!("cores: {:?}", aetherflow::pinning::available_cores());
     println!("samples={SAMPLES} warmup={WARMUP} throughput_n={THROUGHPUT_N}\n");
 
@@ -345,6 +437,14 @@ fn main() {
         "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8.1}",
         "kompact-ask", c50, c90, c99, c999, cmax, c99 as f64 / c50 as f64
     );
+    #[cfg(target_os = "linux")]
+    {
+        let (g50, g90, g99, g999, gmax) = glommio_bench::pingpong();
+        println!(
+            "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8.1}",
+            "glommio", g50, g90, g99, g999, gmax, g99 as f64 / g50 as f64
+        );
+    }
 
     println!("\n## ask (request-reply) RTT (ns) — zero-alloc vs kameo's per-call oneshot");
     let (q50, q90, q99, q999, qmax) = aether_ask();
@@ -364,6 +464,8 @@ fn main() {
     println!("{:<10} {:>16.0}", "aether", a_tp);
     println!("{:<10} {:>16.0}", "tokio", t_tp);
     println!("{:<10} {:>16.0}", "kompact", k_tp);
+    #[cfg(target_os = "linux")]
+    println!("{:<10} {:>16.0}", "glommio", glommio_bench::throughput());
 
     println!("\n注: aether はビジースピン(低レイテンシ↔CPU 消費)。Tokio は park/wake。同条件ではない。");
 }
