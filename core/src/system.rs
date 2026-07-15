@@ -394,6 +394,11 @@ impl Drop for System {
     }
 }
 
+/// 1 actor 訪問あたりに連続処理する最大メッセージ数(バッチドレイン)。
+/// 外側スケジューラループ(制御チャネル確認等)のオーバヘッドを償却して throughput を上げる。
+/// 大きすぎると同一コアの他 actor の公平性が落ちるので上限を設ける。
+const BATCH_DRAIN: usize = 128;
+
 /// コアスレッドの本体。制御メッセージと actor 群を交互に捌く run-to-completion ループ。
 fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, idle: IdleStrategy) {
     pinning::pin_current_thread_to(core_index); // best-effort(macOS は no-op)
@@ -433,7 +438,25 @@ fn core_loop(core_index: usize, control: ctrl::Receiver<Control>, idle: IdleStra
             match actors[i].poll_one() {
                 PollOutcome::Worked => {
                     did_work = true;
-                    i += 1;
+                    // バッチドレイン: 同一 actor を最大 BATCH_DRAIN 通まで続けて処理し、
+                    // 外側ループ(制御チャネル try_recv 等)のオーバヘッドを 1/BATCH に償却する。
+                    // パニック分離は維持(バッチ内でパニックしたら通常どおり切り離す)。
+                    let mut panicked = false;
+                    for _ in 1..BATCH_DRAIN {
+                        match actors[i].poll_one() {
+                            PollOutcome::Worked => {}
+                            PollOutcome::Empty => break,
+                            PollOutcome::Panicked => {
+                                panicked = true;
+                                break;
+                            }
+                        }
+                    }
+                    if panicked {
+                        drop(actors.swap_remove(i)); // i 据え置き(末尾が詰まる)
+                    } else {
+                        i += 1;
+                    }
                 }
                 PollOutcome::Panicked => {
                     // パニックした actor を切り離す。壊れた状態には on_stop を呼ばず drop するだけ。
