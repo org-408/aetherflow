@@ -142,9 +142,14 @@ them than have you discover them:
   when you `ask`, you get `Err(AskError::Closed)`. But the reply cell lives on the
   caller's stack, so if an actor *stores* the `Responder` instead of replying, the
   caller blocks. Generation-tagged reply slots are on the roadmap.
-- **Lock-free queue verification.** Concurrent tests plus a Miri UB check on the
-  single-threaded unsafe paths pass today; exhaustive interleaving verification
-  (Loom) is on the roadmap before 1.0.
+- **Lock-free queue verification.** The MPSC mailbox and the SPSC ring are checked
+  by Loom, which explores every legal thread interleaving of small models rather
+  than whichever one the hardware happened to produce; Miri covers UB on the
+  unsafe paths. The models are deliberately tiny (two threads, capacity of one or
+  two) because the search space explodes, so they prove the ordering discipline
+  rather than the whole queue: `cargo test --lib --release -p aetherflow` with
+  `RUSTFLAGS="--cfg aetherflow_loom"`. The `ask` reply cell is not yet modelled —
+  it is being redesigned (see the liveness limitation above).
 - **`IdleStrategy::BusySpin` is the default** (100% CPU per core) — use
   `IdleStrategy::backoff()` on shared or battery-powered machines.
 

@@ -141,7 +141,8 @@ impl<A: Actor> ActorRef<A> {
     }
 }
 
-#[cfg(test)]
+// loom ビルドでは実ランタイム(= loom 型)をモデル外で動かせないため対象外。
+#[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
     use crate::System;

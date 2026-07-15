@@ -52,6 +52,7 @@
 // 現在の公開 API(System)は MPSC mailbox を使うため、これは予約の tested primitive。
 #[allow(dead_code)]
 mod spsc;
+mod sync; // std/loom 切替シム(検証時のみ loom 型へ差し替え)
 
 mod ask;
 mod metrics;

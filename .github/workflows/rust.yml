@@ -48,6 +48,38 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  # Loom explores every legal thread interleaving of the lock-free queues, which
+  # is what catches a missing Acquire/Release — a class of bug that ordinary
+  # tests and Miri both pass straight through, since it only shows up under an
+  # ordering the hardware happens not to produce that run.
+  #
+  # The cfg is crate-specific on purpose: RUSTFLAGS --cfg reaches every crate in
+  # the graph, and a bare `--cfg loom` breaks dependencies that carry their own
+  # loom paths without depending on loom (concurrent-queue, via dev-deps). This
+  # is the same workaround crossbeam uses with crossbeam_loom.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            target/
+          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-loom-
+
+      - name: Loom (mpsc / spsc interleavings)
+        run: cargo test --lib --release -p aetherflow
+        env:
+          RUSTFLAGS: --cfg aetherflow_loom
+
   dependency-check:
     runs-on: ubuntu-latest
     steps:

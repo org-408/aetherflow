@@ -27,6 +27,16 @@ kompact = "0.11"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 glommio = "0.9"
 
+# Loom = 並行インターリーブの網羅探索(`--cfg aetherflow_loom` の時だけリンクされる = 本番に入らない)。
+# cfg 名を crate 固有にしているのは、RUSTFLAGS の --cfg が依存クレートにも伝播し、
+# 素の `loom` だと concurrent-queue 等が壊れるため(crossbeam_loom と同じ回避策)。
+[target.'cfg(aetherflow_loom)'.dependencies]
+loom = "0.7"
+
+# 独自 cfg なので rustc に既知だと教える(でないと unexpected_cfgs 警告 → CI の -D warnings で落ちる)。
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aetherflow_loom)'] }
+
 [[bench]]
 name = "latency"
 harness = false

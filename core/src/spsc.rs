@@ -9,10 +9,8 @@
 //!   同居すると、片方の更新が他方のキャッシュを無効化して無駄が出る(concepts-explained 参照)。
 //! - **有界**: 満杯時は `Full` を返してバックプレッシャ。無限バッファでメモリを溶かさない。
 
-use std::cell::UnsafeCell;
+use crate::sync::{Arc, AtomicBool, AtomicUsize, Ordering, UnsafeCell};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// 64 バイト境界に整列させ、隣接フィールドとのキャッシュライン共有(false sharing)を防ぐ。
 #[repr(align(64))]
@@ -36,12 +34,14 @@ unsafe impl<T: Send> Sync for Ring<T> {}
 impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
         // 未消費のまま残っているスロット(head..tail)を drop する。
-        let head = *self.head.0.get_mut();
-        let tail = *self.tail.0.get_mut();
+        // &mut self = 他スレッドは存在しないので relaxed で十分(loom の atomic には
+        // get_mut が無いため、両ビルドで同一に保てる load を使う)。
+        let head = self.head.0.load(Ordering::Relaxed);
+        let tail = self.tail.0.load(Ordering::Relaxed);
         for pos in head..tail {
             let idx = pos % self.cap;
             // 未初期化スロットには触れない(head..tail のみが初期化済み)。
-            unsafe { (*self.slots[idx].get()).assume_init_drop() };
+            self.slots[idx].with_mut(|p| unsafe { (*p).assume_init_drop() });
         }
     }
 }
@@ -91,7 +91,7 @@ impl<T> Producer<T> {
             return Err(TrySendError::Full(item));
         }
         let idx = tail % ring.cap;
-        unsafe { (*ring.slots[idx].get()).write(item) };
+        ring.slots[idx].with_mut(|p| unsafe { (*p).write(item) });
         // 書き込み完了を公開。消費者はこの Release と同期して item を読む。
         ring.tail.0.store(tail + 1, Ordering::Release);
         Ok(())
@@ -130,7 +130,7 @@ impl<T> Consumer<T> {
             return None;
         }
         let idx = head % ring.cap;
-        let item = unsafe { (*ring.slots[idx].get()).assume_init_read() };
+        let item = ring.slots[idx].with_mut(|p| unsafe { (*p).assume_init_read() });
         // スロットを空けたことを公開。
         ring.head.0.store(head + 1, Ordering::Release);
         Some(item)
@@ -142,7 +142,8 @@ impl<T> Consumer<T> {
     }
 }
 
-#[cfg(test)]
+// loom ビルドでは loom 型をモデル外で触れないため、通常テストは対象外にする。
+#[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
@@ -224,5 +225,66 @@ mod tests {
             }
         }
         producer.join().unwrap();
+    }
+}
+
+/// Loom による並行インターリーブ検証(`RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib` でのみ動く)。
+///
+/// SPSC は「単一ライター原則」(tail は生産者だけ、head は消費者だけが書く)に依存しており、
+/// 正しさは head/tail の Acquire/Release だけで担保される。その担保が本当に効いているかを
+/// 順序の網羅探索で確かめる。
+#[cfg(all(test, aetherflow_loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    /// **リングの周回**: 容量 1 に 2 通を通す(1 通目が消費されるまで 2 通目は Full)。
+    /// 満杯→消費→再利用のハンドシェイクが、どの順序でも値を壊さないこと。
+    #[test]
+    fn wraparound_preserves_values_and_order() {
+        loom::model(|| {
+            let (tx, rx) = channel::<u32>(1);
+
+            let h = thread::spawn(move || {
+                // Full の間は譲って再試行(push_blocking と同じ理屈を明示的に書く)。
+                for i in 1..=2u32 {
+                    loop {
+                        match tx.try_push(i) {
+                            Ok(()) => break,
+                            Err(_) => thread::yield_now(),
+                        }
+                    }
+                }
+            });
+
+            let mut got = Vec::new();
+            while got.len() < 2 {
+                if let Some(v) = rx.try_pop() {
+                    got.push(v);
+                } else {
+                    thread::yield_now();
+                }
+            }
+            h.join().unwrap();
+            assert_eq!(got, vec![1, 2], "FIFO 順序が保たれること(スロット再利用込み)");
+        });
+    }
+
+    /// **生産者消滅の公開**: `Producer` が drop されたら消費者は `is_closed` で観測でき、
+    /// かつ drop 前に送った値は失われない(閉じたことが先に見えて値が見えない、が無い)。
+    #[test]
+    fn close_is_visible_after_pending_value() {
+        loom::model(|| {
+            let (tx, rx) = channel::<u32>(1);
+
+            let h = thread::spawn(move || {
+                tx.try_push(7).ok();
+                drop(tx); // closed = true を公開
+            });
+            h.join().unwrap();
+
+            assert!(rx.is_closed(), "生産者消滅が観測できること");
+            assert_eq!(rx.try_pop(), Some(7), "閉じても未消費の値は残ること");
+        });
     }
 }

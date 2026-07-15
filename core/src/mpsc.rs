@@ -11,10 +11,8 @@
 //!
 //! 容量は 2 の冪に切り上げ、`& mask` で index を取る。
 
-use std::cell::UnsafeCell;
+use crate::sync::{Arc, AtomicBool, AtomicUsize, Ordering, UnsafeCell};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 pub use crate::TrySendError;
 
@@ -61,7 +59,7 @@ impl<T> Queue<T> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        unsafe { (*slot.val.get()).write(item) };
+                        slot.val.with_mut(|p| unsafe { (*p).write(item) });
                         // 消費者はこの Release と同期して読む。
                         slot.seq.store(pos.wrapping_add(1), Ordering::Release);
                         return Ok(());
@@ -96,7 +94,7 @@ impl<T> Queue<T> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        let item = unsafe { (*slot.val.get()).assume_init_read() };
+                        let item = slot.val.with_mut(|p| unsafe { (*p).assume_init_read() });
                         // スロットを次の一周ぶん先の seq にして生産者へ解放。
                         slot.seq
                             .store(pos.wrapping_add(mask).wrapping_add(1), Ordering::Release);
@@ -221,7 +219,8 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-#[cfg(test)]
+// loom ビルドでは loom 型をモデル外で触れないため、通常テストは対象外にする。
+#[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
@@ -335,5 +334,86 @@ mod tests {
             tx.try_send(Tracked).ok();
         }
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// Loom による並行インターリーブ検証(`RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib` でのみ動く)。
+///
+/// Miri は「その実行が UB か」を見るが、**別のスレッド順序なら壊れる**バグは見つけられない。
+/// Loom は許される順序を網羅探索するので、Acquire/Release の張り忘れ(= 書いた値が
+/// 相手に見えない)や CAS 競合での取りこぼしを検出できる。
+///
+/// モデルは意図的に極小(スレッド2・容量2・1通ずつ)── loom の探索は組合せ爆発するため、
+/// 「小さくても順序は全部見る」のが正しい使い方。
+#[cfg(all(test, aetherflow_loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    /// **多生産者の肝**: 2 生産者が `enqueue_pos` を CAS で奪い合っても、
+    /// メッセージが消えも重複もしない(どの順序でも ちょうど 1 回ずつ届く)。
+    #[test]
+    fn two_producers_no_loss_no_duplication() {
+        loom::model(|| {
+            let (tx1, rx) = channel::<u32>(2);
+            let tx2 = tx1.clone();
+
+            let h1 = thread::spawn(move || tx1.try_send(1).is_ok());
+            let h2 = thread::spawn(move || tx2.try_send(2).is_ok());
+
+            let ok1 = h1.join().unwrap();
+            let ok2 = h2.join().unwrap();
+            assert!(ok1 && ok2, "容量 2 に 2 通なので両方入るはず");
+
+            let mut got = Vec::new();
+            while let Some(v) = rx.try_recv() {
+                got.push(v);
+            }
+            got.sort_unstable();
+            assert_eq!(got, vec![1, 2], "取りこぼし/重複が無いこと");
+        });
+    }
+
+    /// **生産者→消費者の可視性**: `seq` の Release/Acquire が正しければ、
+    /// 消費者が値を観測できた時点で中身の書き込みも必ず見えている。
+    #[test]
+    fn producer_consumer_handshake_publishes_value() {
+        loom::model(|| {
+            let (tx, rx) = channel::<u32>(1);
+
+            let h = thread::spawn(move || {
+                tx.try_send(42).ok();
+            });
+
+            // 生産者がいつ走るかは loom が全順序を試す。観測できたら中身は必ず 42。
+            loop {
+                if let Some(v) = rx.try_recv() {
+                    assert_eq!(v, 42, "seq を観測できたのに値が見えない = 順序バグ");
+                    break;
+                }
+                thread::yield_now();
+            }
+            h.join().unwrap();
+        });
+    }
+
+    /// **消費者消滅の公開**: `Receiver` が drop された後の送信は必ず `Closed` になる
+    /// (`send_blocking` が永久スピンしないための前提)。
+    #[test]
+    fn send_after_receiver_drop_is_closed() {
+        loom::model(|| {
+            let (tx, rx) = channel::<u32>(1);
+
+            let h = thread::spawn(move || {
+                drop(rx);
+            });
+            h.join().unwrap();
+
+            // 消費者が確実に消えた後なので Closed 以外はありえない。
+            match tx.try_send(1) {
+                Err(TrySendError::Closed(v)) => assert_eq!(v, 1, "元の値が返ること"),
+                other => panic!("Closed を期待したが {:?} だった", other.is_ok()),
+            }
+        });
     }
 }
