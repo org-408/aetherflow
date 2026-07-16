@@ -155,7 +155,12 @@ fn on_writable(&mut self, io: &mut Io) { io.resume_reads(); /* 続き */ }   // 
 4. accept したコネクションのコア割り当て(round-robin / least-conn)。
 5. TLS・部分書き込み・EOF 半クローズの扱い(v1 スコープに含めるか)。
 
-## 8. 次の一歩
-- この表面で合意 → 最小実装(まず単一コア epoll/busy-poll の echo、Linux)→ glommio と echo で end-to-end
-  latency 比較 → framed / backpressure を足す。
-- 実測は AWS/Latitude(macOS 不可)。設計合意までは macOS で進められる。
+## 8. 状態と次の一歩
+- **[済 2026-07-16] 表面 API + ポータブル参照バックエンドを実装**(`core/src/net.rs`、feature `net`、
+  既定 OFF)。`Connection`/`Io`/`FramedConnection`/`Codec`(`LengthPrefixed`/`Lines`)/`serve`。
+  macOS で compile & test 済(echo・framed lines・length-prefixed・on_open/on_close、4 テスト緑)。
+  参照 reactor は nonblocking 単一スレッド = **busy-poll 性能版ではない**(API 確定用の土台)。
+- **次**: (a) busy-poll reactor(各コアが socket を回す)を `#[cfg(target_os="linux")]` で実装し
+  `System::listen` に統合 → (b) glommio と echo で end-to-end latency + throughput をフェア比較
+  → (c) backpressure(`on_writable`/`pause_reads`)を上級 opt-in で追加。
+- 実測は AWS/Latitude(macOS 不可)。設計・API は macOS で進められる(済)。

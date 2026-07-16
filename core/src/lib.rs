@@ -61,6 +61,11 @@ mod system;
 
 pub mod pinning;
 
+/// I/O as messages(DRAFT, feature `net`)。接続=actor、受信=メッセージ、送信=非ブロッキング handle。
+/// 現状はポータブルな参照バックエンド(busy-poll 性能版は Linux で後追い)。`docs/io-surface-design.md`。
+#[cfg(feature = "net")]
+pub mod net;
+
 pub use ask::{AskError, Responder};
 pub use metrics::LatencySnapshot;
 pub use system::{ActorRef, IdleStrategy, RestartPolicy, SchedulingPolicy, SpawnBuilder, System};

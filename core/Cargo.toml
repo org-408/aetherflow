@@ -12,6 +12,11 @@ keywords = ["actor", "concurrent", "thread-per-core", "low-latency"]
 categories = ["concurrency", "asynchronous"]
 description = "A high-performance, thread-per-core actor runtime for Rust. Messages move with zero-copy ownership, mailboxes are lock-free, and isolation is proven at compile time — so the hot path has no locks, no GC, and no atomic refcounts. Flow at the speed of hardware."
 
+[features]
+# I/O as messages 表面(DRAFT)。まだ既定 OFF ── 公開既定の API を変えずに反復するため。
+# 現状はポータブル参照バックエンド(std のみ)。busy-poll 性能版(Linux)を後で足す。
+net = []
+
 [dependencies]
 # Best-effort core pinning: real sched_setaffinity on Linux, graceful no-op on macOS.
 core_affinity = "0.8"
