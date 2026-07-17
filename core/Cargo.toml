@@ -45,3 +45,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aetherflow_loom)'] }
 [[bench]]
 name = "latency"
 harness = false
+
+[[example]]
+name = "echo_server"
+required-features = ["net"]
