@@ -31,6 +31,8 @@ kompact = "0.11"
 # glommio = io_uring ベース(Linux 専用)。既製 thread-per-core + 薄 actor に対する本丸比較。
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 glommio = "0.9"
+# glommio の TcpStream は futures の Async{Read,Write} 実装 → 拡張トレイトで read/write する。
+futures-lite = "2"
 
 # Loom = 並行インターリーブの網羅探索(`--cfg aetherflow_loom` の時だけリンクされる = 本番に入らない)。
 # cfg 名を crate 固有にしているのは、RUSTFLAGS の --cfg が依存クレートにも伝播し、
@@ -48,4 +50,8 @@ harness = false
 
 [[example]]
 name = "echo_server"
+required-features = ["net"]
+
+[[example]]
+name = "io_bench"
 required-features = ["net"]

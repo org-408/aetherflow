@@ -226,11 +226,43 @@ impl<C: Connection> Conn<C> {
     }
 }
 
-/// サーバを起動する。`addr` に bind し、接続ごとに `factory()` でハンドラを1つ作る。
-///
-/// **参照バックエンド**: 単一スレッドが nonblocking で accept とすべての接続を回す。性能版(コアごと
-/// busy-poll)は別実装(Linux)。API を確定させるための土台。
+/// reactor の回し方。同じ nonblocking コードを、開発機では控えめに、専有コアでは busy-poll で回す。
+#[derive(Clone, Copy)]
+pub struct ServeOptions {
+    /// `true`: sleep せず回し続ける = **busy-poll**(低レイテンシ・専有コア前提。Linux 実測の性能経路)。
+    /// `false`: 各周回で短く sleep = 参照/開発用(共有機で CPU を焼かない)。
+    pub busy_poll: bool,
+    /// `Some(core)`: reactor スレッドをそのコアへ best-effort ピン留め(busy-poll と対で効く)。
+    pub pin_core: Option<usize>,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        // 既定は移植性・開発優先(sleep あり・ピン無し)。busy-poll は明示 opt-in。
+        Self {
+            busy_poll: false,
+            pin_core: None,
+        }
+    }
+}
+
+/// サーバを起動する(既定オプション = 参照/開発用)。`addr` に bind し、接続ごとに `factory()` で
+/// ハンドラを1つ作る。低レイテンシの性能経路は [`serve_with`] に [`ServeOptions`] を渡す。
 pub fn serve<A, F, C>(addr: A, factory: F) -> io::Result<ServerHandle>
+where
+    A: ToSocketAddrs,
+    F: Fn() -> C + Send + 'static,
+    C: Connection,
+{
+    serve_with(addr, factory, ServeOptions::default())
+}
+
+/// [`serve`] にオプションを付けた版。busy-poll + コアピン留めで**専有コアの低レイテンシ経路**にする。
+///
+/// 同じ nonblocking reactor を、`busy_poll` で「sleep せず回し続ける」に切り替えるだけ ── busy-spin の
+/// 思想を I/O へ延長したもの。低コネクション・低レイテンシ slice では fd を舐め続けるのが最適
+/// (epoll は高コネクション向け=別 slice)。
+pub fn serve_with<A, F, C>(addr: A, factory: F, opts: ServeOptions) -> io::Result<ServerHandle>
 where
     A: ToSocketAddrs,
     F: Fn() -> C + Send + 'static,
@@ -243,8 +275,8 @@ where
     let stop_thread = Arc::clone(&stop);
 
     let join = thread::Builder::new()
-        .name("aether-net-ref".into())
-        .spawn(move || reactor_loop(listener, factory, stop_thread))?;
+        .name("aether-net".into())
+        .spawn(move || reactor_loop(listener, factory, stop_thread, opts))?;
 
     Ok(ServerHandle {
         addr: local,
@@ -253,11 +285,14 @@ where
     })
 }
 
-fn reactor_loop<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>)
+fn reactor_loop<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
 where
     F: Fn() -> C,
     C: Connection,
 {
+    if let Some(core) = opts.pin_core {
+        crate::pinning::pin_current_thread_to(core);
+    }
     let mut conns: Vec<Conn<C>> = Vec::new();
     let mut rbuf = [0u8; 4096];
 
@@ -318,8 +353,13 @@ where
             }
         }
 
-        // 参照実装なので開発機を焼かないよう軽く休む(性能版は busy-poll)。
-        thread::sleep(Duration::from_micros(100));
+        // busy-poll: sleep せず回し続ける(専有コア前提の低レイテンシ経路)。
+        // 参照/開発: 各周回で短く休む(共有機で CPU を焼かない)。
+        if opts.busy_poll {
+            std::hint::spin_loop();
+        } else {
+            thread::sleep(Duration::from_micros(100));
+        }
     }
 }
 
