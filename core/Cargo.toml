@@ -12,9 +12,16 @@ keywords = ["actor", "concurrent", "thread-per-core", "low-latency"]
 categories = ["concurrency", "asynchronous"]
 description = "A high-performance, thread-per-core actor runtime for Rust. Messages move with zero-copy ownership, mailboxes are lock-free, and isolation is proven at compile time — so the hot path has no locks, no GC, and no atomic refcounts. Flow at the speed of hardware."
 
+[features]
+# I/O as messages 表面(DRAFT)。まだ既定 OFF ── 公開既定の API を変えずに反復するため。
+# ポータブル参照バックエンド(scan)+ Linux の epoll readiness backend(高並行 tail 用)。
+net = ["dep:libc"]
+
 [dependencies]
 # Best-effort core pinning: real sched_setaffinity on Linux, graceful no-op on macOS.
 core_affinity = "0.8"
+# net feature の Linux epoll backend 用(cfg(linux) の readiness reactor でのみ使用)。
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Stage 0 ベンチのベースライン比較用(work-stealing / 実 actor FW)。
@@ -26,6 +33,8 @@ kompact = "0.11"
 # glommio = io_uring ベース(Linux 専用)。既製 thread-per-core + 薄 actor に対する本丸比較。
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 glommio = "0.9"
+# glommio の TcpStream は futures の Async{Read,Write} 実装 → 拡張トレイトで read/write する。
+futures-lite = "2"
 
 # Loom = 並行インターリーブの網羅探索(`--cfg aetherflow_loom` の時だけリンクされる = 本番に入らない)。
 # cfg 名を crate 固有にしているのは、RUSTFLAGS の --cfg が依存クレートにも伝播し、
@@ -40,3 +49,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aetherflow_loom)'] }
 [[bench]]
 name = "latency"
 harness = false
+
+[[example]]
+name = "echo_server"
+required-features = ["net"]
+
+[[example]]
+name = "io_bench"
+required-features = ["net"]
