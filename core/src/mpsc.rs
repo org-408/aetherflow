@@ -1,15 +1,16 @@
-//! 有界 MPMC ロックフリーキュー(Dmitry Vyukov のアルゴリズム)を、actor mailbox 向けに
-//! MPSC(多生産者・単一消費者)として使う。
+//! A bounded MPMC lock-free queue (Dmitry Vyukov's algorithm), used as an MPSC
+//! (multi-producer, single-consumer) mailbox for actors.
 //!
-//! なぜ MPSC か: マルチコアでは複数の actor が 1 つの actor に送る(routing)ので、
-//! N=1 の SPSC(単一生産者)では足りない。各スロットに sequence 番号を持たせることで、
-//! 生産者は tail を CAS で予約するだけでロック無しに enqueue できる。
+//! Why MPSC: on multicore, several actors send to a single actor (routing), so an
+//! N=1 SPSC (single-producer) queue is not enough. By giving each slot a sequence
+//! number, a producer can enqueue lock-free by merely reserving the tail via CAS.
 //!
-//! 消費者は単一(その actor を所有するコアスレッド)。生産者は任意スレッド(= 送信側)。
-//! - `tail`(enqueue_pos): 生産者が CAS で進める
-//! - `head`(dequeue_pos): 単一消費者が進める
+//! The consumer is single (the core thread that owns that actor). Producers are any
+//! thread (= the senders).
+//! - `tail` (enqueue_pos): advanced by producers via CAS
+//! - `head` (dequeue_pos): advanced by the single consumer
 //!
-//! 容量は 2 の冪に切り上げ、`& mask` で index を取る。
+//! Capacity is rounded up to a power of two, and the index is taken with `& mask`.
 
 use crate::sync::{Arc, AtomicBool, AtomicUsize, Ordering, UnsafeCell};
 use std::mem::MaybeUninit;
@@ -29,9 +30,9 @@ struct Queue<T> {
     mask: usize,
     enqueue_pos: CachePadded<AtomicUsize>,
     dequeue_pos: CachePadded<AtomicUsize>,
-    /// 生きている生産者数。0 になったら「もう新しいメッセージは来ない」。
+    /// Number of live producers. Once it reaches 0, "no more messages will arrive".
     producers: CachePadded<AtomicUsize>,
-    /// 消費者(Receiver)が生きているか。false = 受信 actor が消滅済み = 送信不能。
+    /// Whether the consumer (Receiver) is alive. false = the receiving actor is gone = sends are impossible.
     consumer_alive: CachePadded<AtomicBool>,
 }
 
@@ -40,7 +41,7 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 
 impl<T> Queue<T> {
     fn enqueue(&self, item: T) -> Result<(), TrySendError<T>> {
-        // 受信 actor が消滅済みなら、満杯かどうかに関わらず送信不能(元メッセージを返す)。
+        // If the receiving actor is gone, sending is impossible regardless of fullness (return the original message).
         if !self.consumer_alive.0.load(Ordering::Acquire) {
             return Err(TrySendError::Closed(item));
         }
@@ -51,7 +52,7 @@ impl<T> Queue<T> {
             let seq = slot.seq.load(Ordering::Acquire);
             let dif = (seq as isize).wrapping_sub(pos as isize);
             if dif == 0 {
-                // このスロットは書ける。tail を CAS で予約。
+                // This slot is writable. Reserve the tail via CAS.
                 match self.enqueue_pos.0.compare_exchange_weak(
                     pos,
                     pos.wrapping_add(1),
@@ -60,20 +61,20 @@ impl<T> Queue<T> {
                 ) {
                     Ok(_) => {
                         slot.val.with_mut(|p| unsafe { (*p).write(item) });
-                        // 消費者はこの Release と同期して読む。
+                        // The consumer reads in sync with this Release.
                         slot.seq.store(pos.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
                     Err(actual) => pos = actual,
                 }
             } else if dif < 0 {
-                // 一周遅れ = 満杯。消費者がこの間に消えていれば Closed、生きていれば Full。
+                // One lap behind = full. If the consumer vanished meanwhile, Closed; if still alive, Full.
                 if !self.consumer_alive.0.load(Ordering::Acquire) {
                     return Err(TrySendError::Closed(item));
                 }
                 return Err(TrySendError::Full(item));
             } else {
-                // 別の生産者が進めた直後。再読込。
+                // Another producer just advanced it. Re-read.
                 pos = self.enqueue_pos.0.load(Ordering::Relaxed);
             }
         }
@@ -95,7 +96,7 @@ impl<T> Queue<T> {
                 ) {
                     Ok(_) => {
                         let item = slot.val.with_mut(|p| unsafe { (*p).assume_init_read() });
-                        // スロットを次の一周ぶん先の seq にして生産者へ解放。
+                        // Set the slot's seq one full lap ahead to release it back to producers.
                         slot.seq
                             .store(pos.wrapping_add(mask).wrapping_add(1), Ordering::Release);
                         return Some(item);
@@ -103,14 +104,14 @@ impl<T> Queue<T> {
                     Err(actual) => pos = actual,
                 }
             } else if dif < 0 {
-                return None; // 空
+                return None; // empty
             } else {
                 pos = self.dequeue_pos.0.load(Ordering::Relaxed);
             }
         }
     }
 
-    /// 消費者専用: 非破壊で空かどうか。
+    /// Consumer-only: non-destructively check whether it is empty.
     fn is_empty(&self) -> bool {
         let pos = self.dequeue_pos.0.load(Ordering::Relaxed);
         let slot = &self.buffer[pos & self.mask];
@@ -121,22 +122,22 @@ impl<T> Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        // 残っているアイテムを drain して drop。
+        // Drain and drop any remaining items.
         while self.dequeue().is_some() {}
     }
 }
 
-/// 送信端(多生産者)。`Clone` 可能 = 複数の送信元を許す。
+/// The sending end (multi-producer). `Clone`-able = multiple senders are allowed.
 pub struct Sender<T> {
     q: Arc<Queue<T>>,
 }
 
-/// 受信端(単一消費者)。
+/// The receiving end (single consumer).
 pub struct Receiver<T> {
     q: Arc<Queue<T>>,
 }
 
-/// 容量 `capacity` 以上(2 の冪に切り上げ)の MPSC を作る。
+/// Create an MPSC with capacity at least `capacity` (rounded up to a power of two).
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let cap = capacity.max(1).next_power_of_two();
     let mut buffer = Vec::with_capacity(cap);
@@ -158,23 +159,23 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
-    /// アイテムを move で送る。満杯なら `Err(TrySendError::Full)`、受信 actor 消滅なら
-    /// `Err(TrySendError::Closed)`(いずれも元アイテムを返す)。
+    /// Send an item by move. Returns `Err(TrySendError::Full)` if full, or
+    /// `Err(TrySendError::Closed)` if the receiving actor is gone (both return the original item).
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.q.enqueue(item)
     }
 
-    // --- observability(既存の enqueue/dequeue カウンタを露出するだけ = hot path 追加コストゼロ) ---
+    // --- observability (merely exposes the existing enqueue/dequeue counters = zero added hot-path cost) ---
 
-    /// これまでに enqueue された総数(送信総数)。
+    /// Total number enqueued so far (total sent).
     pub fn total_enqueued(&self) -> usize {
         self.q.enqueue_pos.0.load(Ordering::Relaxed)
     }
-    /// これまでに dequeue された総数(消費総数)。
+    /// Total number dequeued so far (total consumed).
     pub fn total_dequeued(&self) -> usize {
         self.q.dequeue_pos.0.load(Ordering::Relaxed)
     }
-    /// 現在の mailbox 滞留数(enqueue − dequeue)。近似(並行更新中のスナップショット)。
+    /// Current mailbox depth (enqueue − dequeue). Approximate (a snapshot during concurrent updates).
     pub fn depth(&self) -> usize {
         self.total_enqueued().saturating_sub(self.total_dequeued())
     }
@@ -189,23 +190,23 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        // 最後の生産者が消えたことを Release で公開(消費者が Acquire で観測)。
+        // Publish via Release that the last producer is gone (the consumer observes via Acquire).
         self.q.producers.0.fetch_sub(1, Ordering::Release);
     }
 }
 
 impl<T> Receiver<T> {
-    /// アイテムを 1 つ取り出す。空なら `None`。
+    /// Take one item. Returns `None` if empty.
     pub fn try_recv(&self) -> Option<T> {
         self.q.dequeue()
     }
 
-    /// 生きている生産者がいるか(= まだ送られてくる可能性があるか)。
+    /// Whether any producers are alive (= whether more messages may still arrive).
     pub fn producers_alive(&self) -> bool {
         self.q.producers.0.load(Ordering::Acquire) > 0
     }
 
-    /// 非破壊の空判定。
+    /// Non-destructive emptiness check.
     pub fn is_empty(&self) -> bool {
         self.q.is_empty()
     }
@@ -213,13 +214,13 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        // 消費者(この actor を所有するコア)の消滅を Release で公開。
-        // 以後の enqueue は Closed を返し、send_blocking の永久スピンを防ぐ。
+        // Publish via Release that the consumer (the core owning this actor) is gone.
+        // Subsequent enqueues return Closed, preventing send_blocking from spinning forever.
         self.q.consumer_alive.0.store(false, Ordering::Release);
     }
 }
 
-// loom ビルドでは loom 型をモデル外で触れないため、通常テストは対象外にする。
+// In loom builds, loom types cannot be touched outside the model, so exclude the ordinary tests.
 #[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
@@ -231,7 +232,7 @@ mod tests {
         for i in 0..4 {
             assert!(tx.try_send(i).is_ok());
         }
-        assert!(tx.try_send(99).is_err()); // 満杯
+        assert!(tx.try_send(99).is_err()); // full
         for i in 0..4 {
             assert_eq!(rx.try_recv(), Some(i));
         }
@@ -244,7 +245,7 @@ mod tests {
         assert!(rx.producers_alive());
         let tx2 = tx.clone();
         drop(tx);
-        assert!(rx.producers_alive()); // tx2 が生きている
+        assert!(rx.producers_alive()); // tx2 is still alive
         drop(tx2);
         assert!(!rx.producers_alive());
     }
@@ -262,9 +263,9 @@ mod tests {
     #[test]
     fn try_send_after_receiver_dropped_is_closed() {
         let (tx, rx) = channel::<u32>(4);
-        drop(rx); // 消費者消滅 → consumer_alive=false
+        drop(rx); // consumer gone → consumer_alive=false
         match tx.try_send(1) {
-            Err(TrySendError::Closed(v)) => assert_eq!(v, 1), // 元アイテムを返す
+            Err(TrySendError::Closed(v)) => assert_eq!(v, 1), // returns the original item
             other => panic!("expected Closed, got {other:?}"),
         }
     }
@@ -280,7 +281,7 @@ mod tests {
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..PER {
-                    // 満杯なら消費者が捌くまでスピン(バックプレッシャ)。
+                    // If full, spin until the consumer drains it (backpressure).
                     let mut item = p * PER + i;
                     loop {
                         match tx.try_send(item) {
@@ -298,7 +299,7 @@ mod tests {
                 }
             }));
         }
-        drop(tx); // 元の送信端を落とす(クローンが生きている)
+        drop(tx); // drop the original sender (clones are still alive)
 
         let total = PRODUCERS * PER;
         let mut seen = vec![false; total];
@@ -337,21 +338,22 @@ mod tests {
     }
 }
 
-/// Loom による並行インターリーブ検証(`RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib` でのみ動く)。
+/// Concurrent interleaving verification with Loom (only runs under `RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib`).
 ///
-/// Miri は「その実行が UB か」を見るが、**別のスレッド順序なら壊れる**バグは見つけられない。
-/// Loom は許される順序を網羅探索するので、Acquire/Release の張り忘れ(= 書いた値が
-/// 相手に見えない)や CAS 競合での取りこぼしを検出できる。
+/// Miri checks "is this execution UB", but cannot find bugs that **break only under a
+/// different thread ordering**. Loom exhaustively explores the allowed orderings, so it can
+/// detect a missing Acquire/Release (= a written value not visible to the other side) or a
+/// lost update under CAS contention.
 ///
-/// モデルは意図的に極小(スレッド2・容量2・1通ずつ)── loom の探索は組合せ爆発するため、
-/// 「小さくても順序は全部見る」のが正しい使い方。
+/// The model is deliberately tiny (2 threads, capacity 2, one message each) ── because loom's
+/// exploration combinatorially explodes, "small but see every ordering" is the correct usage.
 #[cfg(all(test, aetherflow_loom))]
 mod loom_tests {
     use super::*;
     use loom::thread;
 
-    /// **多生産者の肝**: 2 生産者が `enqueue_pos` を CAS で奪い合っても、
-    /// メッセージが消えも重複もしない(どの順序でも ちょうど 1 回ずつ届く)。
+    /// **The crux of multi-producer**: even when 2 producers contend for `enqueue_pos` via CAS,
+    /// no message is lost or duplicated (each arrives exactly once under any ordering).
     #[test]
     fn two_producers_no_loss_no_duplication() {
         loom::model(|| {
@@ -363,19 +365,19 @@ mod loom_tests {
 
             let ok1 = h1.join().unwrap();
             let ok2 = h2.join().unwrap();
-            assert!(ok1 && ok2, "容量 2 に 2 通なので両方入るはず");
+            assert!(ok1 && ok2, "capacity 2 with 2 messages, so both should fit");
 
             let mut got = Vec::new();
             while let Some(v) = rx.try_recv() {
                 got.push(v);
             }
             got.sort_unstable();
-            assert_eq!(got, vec![1, 2], "取りこぼし/重複が無いこと");
+            assert_eq!(got, vec![1, 2], "no loss and no duplication");
         });
     }
 
-    /// **生産者→消費者の可視性**: `seq` の Release/Acquire が正しければ、
-    /// 消費者が値を観測できた時点で中身の書き込みも必ず見えている。
+    /// **Producer→consumer visibility**: if the Release/Acquire on `seq` is correct, then by the
+    /// time the consumer can observe the value, the payload write is necessarily visible too.
     #[test]
     fn producer_consumer_handshake_publishes_value() {
         loom::model(|| {
@@ -385,10 +387,10 @@ mod loom_tests {
                 tx.try_send(42).ok();
             });
 
-            // 生産者がいつ走るかは loom が全順序を試す。観測できたら中身は必ず 42。
+            // Loom tries every ordering for when the producer runs. Once observed, the payload is necessarily 42.
             loop {
                 if let Some(v) = rx.try_recv() {
-                    assert_eq!(v, 42, "seq を観測できたのに値が見えない = 順序バグ");
+                    assert_eq!(v, 42, "observed seq but value not visible = ordering bug");
                     break;
                 }
                 thread::yield_now();
@@ -397,8 +399,8 @@ mod loom_tests {
         });
     }
 
-    /// **消費者消滅の公開**: `Receiver` が drop された後の送信は必ず `Closed` になる
-    /// (`send_blocking` が永久スピンしないための前提)。
+    /// **Publishing consumer teardown**: a send after `Receiver` is dropped is always `Closed`
+    /// (the precondition for `send_blocking` not spinning forever).
     #[test]
     fn send_after_receiver_drop_is_closed() {
         loom::model(|| {
@@ -409,10 +411,10 @@ mod loom_tests {
             });
             h.join().unwrap();
 
-            // 消費者が確実に消えた後なので Closed 以外はありえない。
+            // Since the consumer is definitively gone, nothing but Closed is possible.
             match tx.try_send(1) {
-                Err(TrySendError::Closed(v)) => assert_eq!(v, 1, "元の値が返ること"),
-                other => panic!("Closed を期待したが {:?} だった", other.is_ok()),
+                Err(TrySendError::Closed(v)) => assert_eq!(v, 1, "the original value is returned"),
+                other => panic!("expected Closed but got {:?}", other.is_ok()),
             }
         });
     }

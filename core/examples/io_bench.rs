@@ -1,13 +1,13 @@
-//! I/O ベンチ — AetherFlow busy-poll echo vs 任意の TCP echo(glommio 等)。
+//! I/O bench — AetherFlow busy-poll echo vs any TCP echo (glommio, etc.).
 //!
-//! 使い方(同一マシンで server と client を別コアに固定して測る):
-//!   # AetherFlow echo server(busy-poll + core 0 ピン)
+//! Usage (measure with server and client pinned to separate cores on the same machine):
+//!   # AetherFlow echo server (busy-poll + pinned to core 0)
 //!   cargo run --release --example io_bench --features net -- aether-server 127.0.0.1:9001 0
-//!   # client(RTT p50/p99 + throughput)を別コアで
+//!   # client (RTT p50/p99 + throughput) on a separate core
 //!   taskset -c 1 cargo run --release --example io_bench --features net -- client 127.0.0.1:9001 200000
 //!
-//! server はプロトコル非依存(受けたバイトをそのまま返す)なので、同じ client で glommio echo
-//! (`echo_glommio`)も測れる = フェア比較。
+//! The server is protocol-agnostic (echoes received bytes verbatim), so the same client can also
+//! measure the glommio echo (`echo_glommio`) = fair comparison.
 
 use aetherflow::net::{serve_on_cores, serve_with, Connection, Io, ServeOptions};
 use std::io::{Read, Write};
@@ -28,12 +28,12 @@ fn main() {
     match mode {
         "aether-server" => {
             let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:9001".into());
-            // 第3引数 = コア指定。"0" 単一 / "0,1,2,3" 複数(thread-per-core, SO_REUSEPORT)。
+            // 3rd arg = core selection. "0" single / "0,1,2,3" multiple (thread-per-core, SO_REUSEPORT).
             let cores: Vec<usize> = args
                 .get(3)
                 .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
                 .unwrap_or_else(|| vec![0]);
-            // 第4引数 "epoll" で Linux epoll readiness backend、既定は scan busy-poll。
+            // 4th arg "epoll" selects the Linux epoll readiness backend; default is scan busy-poll.
             let epoll = args.get(4).map(|s| s == "epoll").unwrap_or(false);
             let opts = ServeOptions {
                 busy_poll: true,
@@ -66,15 +66,17 @@ fn main() {
     }
 }
 
-/// `conns` 本の接続を並行に張り、合計 `iters` 往復を等分して回す。各接続は自スレッドで
-/// 逐次 request-response。全接続の RTT を集約して分位を出し、throughput は全体の実測。
-/// **エラー耐性**: 接続・送受信が失敗したワーカはそこで打ち切り、集めた分だけ返す(panic しない)。
-/// 失敗数は最後に表示(高並行で fd/backlog 上限に当たっても全体が落ちない)。
+/// Opens `conns` connections concurrently and splits a total of `iters` round-trips evenly across
+/// them. Each connection runs sequential request-response on its own thread. RTTs from all
+/// connections are aggregated to compute percentiles; throughput is measured over the whole run.
+/// **Error tolerance**: a worker whose connect or send/recv fails stops there and returns whatever
+/// it collected (no panic). The failure count is printed at the end (so hitting fd/backlog limits
+/// under high concurrency doesn't bring the whole run down).
 fn run_client(addr: &str, iters: usize, conns: usize) {
     let per = iters / conns.max(1);
     let t0 = Instant::now();
-    // 高並行(数千接続)では接続ごとに1スレッド張るので、既定 8MB スタックだと OOM する。
-    // 小さめ(512KB)にして数千スレッドでもメモリに収める。
+    // Under high concurrency (thousands of connections) we spawn one thread per connection, so the
+    // default 8MB stack would OOM. Use a smaller (512KB) stack so thousands of threads fit in memory.
     let handles: Vec<_> = (0..conns)
         .map(|_| {
             let addr = addr.to_string();
@@ -118,11 +120,11 @@ fn run_client(addr: &str, iters: usize, conns: usize) {
     );
 }
 
-/// 1 接続ぶんの逐次 request-response。io エラーが出たら打ち切って集めた分を返す(`Err(())` は
-/// 接続自体が張れなかった等の全滅)。
+/// Sequential request-response for a single connection. On an io error it stops and returns what it
+/// collected (`Err(())` means total failure, e.g. the connection itself couldn't be established).
 fn conn_worker(addr: &str, iters: usize) -> Result<Vec<u64>, ()> {
     let s = TcpStream::connect(addr).map_err(|_| ())?;
-    let _ = s.set_nodelay(true); // Nagle 無効 = RTT を正しく測る
+    let _ = s.set_nodelay(true); // disable Nagle = measure RTT accurately
     let mut s = s;
     let payload = [0xABu8; 32];
     let mut buf = [0u8; 32];
@@ -136,7 +138,7 @@ fn conn_worker(addr: &str, iters: usize) -> Result<Vec<u64>, ()> {
     for _ in 0..iters {
         let a = Instant::now();
         if s.write_all(&payload).is_err() || s.read_exact(&mut buf).is_err() {
-            break; // 途中失敗: 集めた分で返す
+            break; // mid-run failure: return what was collected
         }
         lat.push(a.elapsed().as_nanos() as u64);
     }

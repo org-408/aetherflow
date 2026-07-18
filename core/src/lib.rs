@@ -1,19 +1,24 @@
-//! # aetherflow-runtime — マルチコア thread-per-core actor ランタイム
+//! # AetherFlow — a multi-core, thread-per-core actor runtime for Rust
 //!
-//! design.md の 4 本柱を実装:
-//! - ①型による隔離 / ②zero-copy move → [`ActorRef::try_send`] が `A::Message` を **move** で取る。
-//!   use-after-send はコンパイルエラー(E0382)。
-//! - ③物理配置 → [`System`] が **コアごとに 1 スレッド**を立ててピン留めし、各スレッドが
-//!   そのコアに割り当てられた多数の actor を run-to-completion で回す。mailbox はコアを跨がない
-//!   lock-free キュー(`mpsc`)。
-//! - ④work-stealing 排除 → Tokio 不使用。actor はコア間を移動しない(静的配置)。
+//! You write **plain synchronous Rust**. An actor is "one message type + one handler"; the type
+//! system proves isolation at compile time, so the hot path has no locks, no GC, and no per-message
+//! `Arc`/refcount. New here? Start with the [guide](https://github.com/org-408/aetherflow/blob/main/docs/guide.md)
+//! and the runnable examples in `core/examples/`.
 //!
-//! ## thread-per-core であって thread-per-actor ではない
-//! 1 コア = 1 OS スレッドが**多数の actor** を回す。actor ごとにスレッドを立てない(それは
-//! thread-per-actor でスケールしない)。同一コアの異種 actor は型消去して 1 スレッドで回し、
-//! 送信は typed な [`ActorRef`] のまま — capability-mapping §7 の「制御面=erased / データ面=typed」。
+//! The four pillars:
+//! - **Type-proven isolation / zero-copy move** — [`ActorRef::try_send`] takes `A::Message` by
+//!   **move**; use-after-send is a compile error (`E0382`).
+//! - **Physical placement** — [`System`] spawns **one pinned thread per core**, and each thread runs
+//!   the many actors placed on that core to completion. Mailboxes are lock-free queues that never
+//!   cross cores.
+//! - **No work-stealing** — no Tokio; actors never migrate between cores (static placement).
 //!
-//! ## 使い方
+//! ## Thread-per-core, not thread-per-actor
+//! One core = one OS thread runs **many actors** (spawning a thread per actor would not scale). On a
+//! given core, differently-typed actors are type-erased to share one thread, while sends stay typed
+//! through [`ActorRef`] — "erased control plane, typed data plane".
+//!
+//! ## Quick start
 //! ```
 //! use aetherflow::{System, Actor};
 //! use std::sync::mpsc;
@@ -26,16 +31,16 @@
 //!
 //! let sys = System::with_cores(2);
 //! let (out, results) = mpsc::channel();
-//! let addr = sys.spawn_on(0, Adder { sum: 0, out });   // コア 0 に配置
+//! let addr = sys.spawn_on(0, Adder { sum: 0, out });   // place on core 0
 //! addr.send_blocking(10);
 //! addr.send_blocking(5);
-//! drop(addr);              // 送信端が全て落ちると、その actor はコアから外れる
-//! sys.shutdown();          // 全コアを停止して join
+//! drop(addr);              // when all send handles drop, the actor leaves the core
+//! sys.shutdown();          // stop every core and join
 //! assert_eq!(results.recv().unwrap(), 10);
 //! assert_eq!(results.recv().unwrap(), 15);
 //! ```
 //!
-//! ## 隔離はコンパイル時に強制される
+//! ## Isolation is enforced at compile time
 //! ```compile_fail
 //! use aetherflow::{System, Actor};
 //! struct Order { qty: u32 }
@@ -44,15 +49,15 @@
 //! let sys = System::with_cores(1);
 //! let addr = sys.spawn_on(0, E);
 //! let order = Order { qty: 100 };
-//! addr.try_send(order).ok();     // move で移譲
-//! println!("{}", order.qty);     // use of moved value `order` (E0382)：コンパイル不能
+//! addr.try_send(order).ok();     // ownership moved into the runtime
+//! println!("{}", order.qty);     // use of moved value `order` (E0382): does not compile
 //! ```
 
-// SPSC は単一生産者の高速パス / 将来のコア間ペアキュー(Seastar 流)用に温存。
-// 現在の公開 API(System)は MPSC mailbox を使うため、これは予約の tested primitive。
+// SPSC is kept as a single-producer fast path / for future cross-core pair queues (Seastar-style).
+// The current public API (System) uses the MPSC mailbox, so this is a reserved tested primitive.
 #[allow(dead_code)]
 mod spsc;
-mod sync; // std/loom 切替シム(検証時のみ loom 型へ差し替え)
+mod sync; // std/loom shim (swaps in loom types only during verification)
 
 mod ask;
 mod metrics;
@@ -61,8 +66,9 @@ mod system;
 
 pub mod pinning;
 
-/// I/O as messages(DRAFT, feature `net`)。接続=actor、受信=メッセージ、送信=非ブロッキング handle。
-/// 現状はポータブルな参照バックエンド(busy-poll 性能版は Linux で後追い)。`docs/io-surface-design.md`。
+/// I/O as messages (DRAFT, feature `net`): connection = actor, inbound bytes = messages, outbound =
+/// a non-blocking handle. Portable scan reactor plus a Linux epoll backend and thread-per-core
+/// serving. See `docs/io-surface-design.md`.
 #[cfg(feature = "net")]
 pub mod net;
 
@@ -70,17 +76,18 @@ pub use ask::{AskError, Responder};
 pub use metrics::LatencySnapshot;
 pub use system::{ActorRef, IdleStrategy, RestartPolicy, SchedulingPolicy, SpawnBuilder, System};
 
-/// 非ブロッキング送信 `try_send` の失敗理由。いずれも**元のメッセージを返す**ので、
-/// 呼び出し側は再ルーティング・永続化・ログ記録ができる。
+/// Why a non-blocking `try_send` failed. Both variants **return the original message** so the caller
+/// can re-route, persist, or log it.
 pub enum TrySendError<T> {
-    /// mailbox が満杯。**一時的なバックプレッシャ**(あとで空けば送れる)。
+    /// The mailbox is full — **transient backpressure** (retry once it drains).
     Full(T),
-    /// 受信 actor が消滅済み(panic 停止 / restart 上限 / shutdown 等)。**恒久的に送信不能**。
+    /// The receiving actor is gone (stopped on panic / restart limit / shutdown) — **permanently
+    /// unsendable**.
     Closed(T),
 }
 
 impl<T> TrySendError<T> {
-    /// 失敗して返ってきた元のメッセージを取り出す(再送・永続化・ログに使う)。
+    /// Recover the message that came back on failure (for retry, persistence, or logging).
     pub fn into_message(self) -> T {
         match self {
             TrySendError::Full(m) | TrySendError::Closed(m) => m,
@@ -88,14 +95,14 @@ impl<T> TrySendError<T> {
     }
 }
 
-/// ブロッキング送信 `send_blocking` の失敗理由。満杯は待つので、残るのは Closed のみ。
+/// Why a blocking `send_blocking` failed. A full mailbox is waited on, so only `Closed` remains.
 pub enum SendError<T> {
-    /// 受信 actor が消滅済み(恒久的に送信不能)。元のメッセージを返す。
+    /// The receiving actor is gone (permanently unsendable). Returns the original message.
     Closed(T),
 }
 
 impl<T> SendError<T> {
-    /// 失敗して返ってきた元のメッセージを取り出す。
+    /// Recover the message that came back on failure.
     pub fn into_message(self) -> T {
         match self {
             SendError::Closed(m) => m,
@@ -103,8 +110,8 @@ impl<T> SendError<T> {
     }
 }
 
-// Debug/Display はメッセージ本体に依存しない(= `T: Debug` を要求しない)。
-// これにより Responder を運ぶメッセージでも `send*(..).unwrap()` がそのまま書ける。
+// Debug/Display do not depend on the message payload (no `T: Debug` bound), so `send*(..).unwrap()`
+// works even for messages that carry a `Responder`.
 impl<T> std::fmt::Debug for TrySendError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -135,22 +142,22 @@ impl<T> std::fmt::Display for SendError<T> {
 }
 impl<T> std::error::Error for SendError<T> {}
 
-/// 型付き actor。メッセージ型は固定で `Send`(= sendable な `iso`/`val` を型で要求)。
+/// A typed actor. The message type is fixed and `Send` (the type demands a sendable value).
 pub trait Actor: Send + 'static {
-    /// この actor が受け取るメッセージの型。
+    /// The type of message this actor receives.
     type Message: Send + 'static;
 
-    /// メッセージ 1 通を処理する。`&mut self`(= `ref`)なので自状態の唯一の所有者。
-    /// 単一コアスレッドが run-to-completion で回すのでロックは要らない。
+    /// Handle one message. `&mut self` is the sole owner of the actor's state, and a single core
+    /// thread runs it to completion, so no lock is needed.
     fn handle(&mut self, msg: Self::Message);
 
-    /// コアに配置され、最初のメッセージ処理前に 1 回呼ばれる。
+    /// Called once after the actor is placed on a core, before it handles its first message.
     fn on_start(&mut self) {}
-    /// supervised actor がパニック後に新品へ差し替えられた直後に呼ばれる(restart)。
-    /// 既定では [`Actor::on_start`] と同じ扱い。
+    /// Called right after a supervised actor is replaced with a fresh one following a panic
+    /// (restart). Defaults to the same behavior as [`Actor::on_start`].
     fn on_restart(&mut self) {
         self.on_start()
     }
-    /// 送信端が全て落ち mailbox を drain し切った後(または system 停止時)に 1 回呼ばれる。
+    /// Called once after all send handles drop and the mailbox is fully drained (or on system stop).
     fn on_stop(&mut self) {}
 }

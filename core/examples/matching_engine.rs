@@ -1,11 +1,11 @@
-//! マルチコアの手触りデモ: シンボル別にコアへ分散した matching engine に、gateway が
-//! 注文をルーティングする。`cargo run --release --example matching_engine`
+//! A multi-core feel demo: a gateway routes orders to a matching engine sharded across cores by
+//! symbol. `cargo run --release --example matching_engine`
 //!
-//! 構成(thread-per-core + sharding):
-//!   gateway(コア0) ──symbol でルーティング──▶ engine[s](コア 1+s、各コアに固定)
+//! Layout (thread-per-core + sharding):
+//!   gateway (core 0) ──route by symbol──▶ engine[s] (core 1+s, pinned to its core)
 //!
-//! これは動作・配線の確認用で、レイテンシ計測ではない(macOS では真のピン留めが効かない。
-//! ベンチは Linux + Stage 0 で kompicsbenches 流に測る — competitive-landscape.md 参照)。
+//! This validates behavior and wiring, not latency (real pinning has no effect on macOS; benchmark
+//! on Linux + Stage 0, kompicsbenches-style — see competitive-landscape.md).
 
 use aetherflow::{pinning, Actor, ActorRef, System};
 use std::sync::mpsc;
@@ -17,7 +17,7 @@ struct Order {
     qty: u32,
 }
 
-/// シンボル 1 つ分の超単純な matching engine(累積約定数量を数えるだけ)。
+/// A dead-simple matching engine for one symbol (just accumulates filled quantity).
 struct Engine {
     symbol: u8,
     filled: u64,
@@ -46,7 +46,7 @@ impl Actor for Engine {
     }
 }
 
-/// 注文をシンボルで該当 engine へ振り分ける(handler 内 → 別コアへ try_send)。
+/// Routes each order to the engine for its symbol (from a handler → try_send to another core).
 struct Gateway {
     engines: Vec<ActorRef<Engine>>,
 }
@@ -62,10 +62,10 @@ fn main() {
     println!("available logical cores: {:?}", pinning::available_cores());
     const SYMBOLS: u8 = 3;
 
-    let sys = System::with_cores((SYMBOLS as usize) + 1); // コア0=gateway、1..=engines
+    let sys = System::with_cores((SYMBOLS as usize) + 1); // core 0 = gateway, 1.. = engines
     let (out, log) = mpsc::channel();
 
-    // engine をシンボルごとに別コアへ。
+    // Place each engine on its own core, one per symbol.
     let engines: Vec<ActorRef<Engine>> = (0..SYMBOLS)
         .map(|s| {
             sys.spawn_on(
@@ -81,7 +81,7 @@ fn main() {
 
     let gateway = sys.spawn_on(0, Gateway { engines: engines.clone() });
 
-    // 12 注文を投入(シンボルは round-robin)。
+    // Submit 12 orders (symbols round-robin).
     for id in 1..=12u64 {
         let order = Order {
             symbol: (id % SYMBOLS as u64) as u8,
@@ -91,14 +91,14 @@ fn main() {
         gateway.send_blocking(order).unwrap();
     }
 
-    // 送信端を全て落として drain → shutdown。
+    // Drop all send handles → drain → shutdown.
     drop(gateway);
     drop(engines);
     drop(out);
     sys.shutdown();
 
     let mut lines: Vec<String> = log.iter().collect();
-    lines.sort(); // 出力順はコア間で非決定的なので整列して表示
+    lines.sort(); // output order is nondeterministic across cores, so sort for display
     for l in lines {
         println!("{l}");
     }

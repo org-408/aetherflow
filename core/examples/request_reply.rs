@@ -1,28 +1,27 @@
-//! request-reply(`ask`)— 送って**返事を待つ**。小さな key-value ストアを actor で作る。
+//! request-reply (`ask`) — send and **wait for a reply**. Build a small key-value store as an actor.
 //!
 //!   cargo run --example request_reply
 //!
-//! ポイント: `ask` は reply スロットを**呼び出しスタック**に置く → **ヒープ確保ゼロ**。
-//! kameo/tokio の ask が毎回 oneshot を heap 確保するのと対照的(所有権モデルが解禁した速さ)。
-//! 上限を付けたいときは `ask_timeout(dur, ..)`。
+//! Key idea: `ask` puts the reply slot on the **caller's stack** → **zero heap allocation**
+//! (kameo/tokio allocate a fresh oneshot per call). This is speed unlocked by the ownership model.
 //!
-//! **注意**: `ask` は呼び出しスレッドをブロックするので、runtime の外(main / I/O スレッド)から呼ぶ。
+//! Note: `ask` blocks the calling thread, so call it from outside the runtime (main / an I/O thread).
 
 use aetherflow::{Actor, Responder, System};
 use std::collections::HashMap;
 
-/// KV ストア actor。状態(`map`)は単一所有 ── ロック不要。
+/// A KV store actor. Its state (`map`) is single-owned — no lock needed.
 struct KvStore {
     map: HashMap<String, i64>,
 }
 
-/// この actor が受け取るコマンド。返事が要るものは `Responder<R>` を運ぶ(= ask の受け口)。
+/// Commands this actor accepts. Ones that need a reply carry a `Responder<R>` (the ask channel).
 enum Cmd {
-    /// 返事不要(fire-and-forget)。`send` で送る。
+    /// No reply (fire-and-forget); send it with `send`.
     Set(String, i64),
-    /// 返事が要る。`ask` で送り、`Responder` 経由で値が返る。
+    /// Needs a reply; send it with `ask`, the value comes back through the `Responder`.
     Get(String, Responder<Option<i64>>),
-    /// キー数を返す。
+    /// Return the number of keys.
     Len(Responder<usize>),
 }
 
@@ -35,7 +34,7 @@ impl Actor for KvStore {
                 self.map.insert(k, v);
             }
             Cmd::Get(k, reply) => {
-                reply.reply(self.map.get(&k).copied()); // 一度だけ返信できる線形トークン
+                reply.reply(self.map.get(&k).copied()); // a linear token you reply through exactly once
             }
             Cmd::Len(reply) => {
                 reply.reply(self.map.len());
@@ -53,11 +52,11 @@ fn main() {
         },
     );
 
-    // 書き込みは fire-and-forget(返事を待たない)。
+    // Writes are fire-and-forget (no reply awaited).
     kv.send_blocking(Cmd::Set("apples".into(), 3)).unwrap();
     kv.send_blocking(Cmd::Set("pears".into(), 7)).unwrap();
 
-    // 読み出しは ask(返事を待つ)。`|reply| ...` に Responder を渡してメッセージを組む。
+    // Reads use `ask` (await the reply). Pass the Responder into `|reply| ...` to build the message.
     let apples: Option<i64> = kv.ask(|reply| Cmd::Get("apples".into(), reply)).unwrap();
     let bananas: Option<i64> = kv.ask(|reply| Cmd::Get("bananas".into(), reply)).unwrap();
     let n: usize = kv.ask(Cmd::Len).unwrap();

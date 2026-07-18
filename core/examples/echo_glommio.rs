@@ -1,11 +1,12 @@
-//! 比較用: glommio の echo サーバ(Linux 専用)。AetherFlow busy-poll echo と**同じ client**
-//! (`io_bench client`)で測る = フェア比較。
+//! For comparison: glommio's echo server (Linux-only). Measured with the **same client**
+//! (`io_bench client`) as the AetherFlow busy-poll echo = fair comparison.
 //!
-//!   単一コア:   cargo run --release --example echo_glommio -- 127.0.0.1:9002 0
-//!   複数コア:   cargo run --release --example echo_glommio -- 127.0.0.1:9002 0,1,2,3
+//!   single core:   cargo run --release --example echo_glommio -- 127.0.0.1:9002 0
+//!   multi core:    cargo run --release --example echo_glommio -- 127.0.0.1:9002 0,1,2,3
 //!
-//! 複数コアは LocalExecutorPoolBuilder(N shard)+ 各 shard が同じ addr に bind(glommio は
-//! SO_REUSEPORT を張るので分散着信)。AetherFlow の serve_on_cores と N 対 N で比べる。
+//! Multi-core uses LocalExecutorPoolBuilder (N shards) with each shard binding the same addr
+//! (glommio sets SO_REUSEPORT, so incoming connections are distributed). Compared N-to-N against
+//! AetherFlow's serve_on_cores.
 
 #[cfg(target_os = "linux")]
 fn main() {
