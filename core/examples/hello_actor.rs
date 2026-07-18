@@ -1,20 +1,21 @@
-//! いちばん小さな AetherFlow — actor を1つ立ててメッセージを送る。
+//! The smallest AetherFlow program — spawn one actor and send it messages.
 //!
 //!   cargo run --example hello_actor
 //!
-//! ポイント: あなたが書くのは **普通の同期 Rust** だけ。actor = 「1つのメッセージ型 + 1つのハンドラ」。
-//! `send` するとメッセージの所有権が runtime に **move** される(= 送った後に使うとコンパイルエラー)。
+//! Key idea: you write **plain synchronous Rust**. An actor is "one message type + one handler".
+//! `send` **moves** the message's ownership into the runtime (using it after send is a compile
+//! error, `E0382`).
 
 use aetherflow::{Actor, System};
 
-/// 挨拶を数える actor。状態(`count`)はフィールドに持つだけ ── ロックも `Arc` も不要
-/// (単一コアスレッドが run-to-completion で回すので `&mut self` が唯一の所有者)。
+/// An actor that counts greetings. State (`count`) is just a field — no lock, no `Arc`, because a
+/// single core thread runs it to completion, so `&mut self` is the sole owner.
 struct Greeter {
     count: u32,
 }
 
 impl Actor for Greeter {
-    type Message = String; // この actor が受け取るメッセージの型(固定)
+    type Message = String; // the (fixed) message type this actor receives
 
     fn on_start(&mut self) {
         println!("[greeter] started");
@@ -31,18 +32,18 @@ impl Actor for Greeter {
 }
 
 fn main() {
-    // 1 コア(= 1 本のスレッド)の runtime を起動。
+    // Start a runtime with 1 core (= 1 thread).
     let sys = System::with_cores(1);
 
-    // コア 0 に actor を置く。返り値はクローン可能な送信ハンドル。
+    // Place the actor on core 0. The returned value is a cloneable send handle.
     let greeter = sys.spawn_on(0, Greeter { count: 0 });
 
     for name in ["Ada", "Alan", "Grace"] {
-        // 文字列の所有権を runtime へ move。actor が gone なら Err(Closed) が返る。
+        // Move the string's ownership into the runtime; Err(Closed) if the actor is gone.
         greeter.send_blocking(name.to_string()).unwrap();
     }
 
-    // 送信端を落として、mailbox を drain し切ってから停止(on_stop が走る)。
+    // Drop the send handle, drain the mailbox, then stop (on_stop runs).
     drop(greeter);
     sys.shutdown();
 }

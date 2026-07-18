@@ -1,20 +1,22 @@
-//! `std` / `loom` 切替シム。
+//! `std` / `loom` switching shim.
 //!
-//! Loom は並行実行の**インターリーブを網羅探索**する検証器で、そのために atomic と
-//! `UnsafeCell` を自前の計装済み型へ差し替える必要がある。`--cfg aetherflow_loom` のときだけ loom の
-//! 型を使い、通常ビルドでは `std` をそのまま使う(= 本番バイナリに loom は一切入らない)。
+//! Loom is a verifier that **exhaustively explores the interleavings** of concurrent execution,
+//! and to do so it must replace the atomics and `UnsafeCell` with its own instrumented types.
+//! Only under `--cfg aetherflow_loom` do we use loom's types; ordinary builds use `std` as-is
+//! (= no loom ends up in the production binary).
 //!
-//! 厄介なのは `UnsafeCell` の API が両者で違うこと: loom は「生ポインタをクロージャに渡す」形
-//! (アクセス範囲を検証器に知らせるため)で、`std` は `.get()` で生ポインタを返す。
-//! そこで `std` 側に loom と同じ `with` / `with_mut` を持つ薄いラッパを被せ、
-//! 呼び出し側(`mpsc` / `spsc`)を**一本のコードに保つ**。
+//! The awkward part is that the `UnsafeCell` API differs between the two: loom "passes a raw
+//! pointer to a closure" (to tell the verifier the access scope), whereas `std` returns a raw
+//! pointer via `.get()`. So we wrap the `std` side in a thin wrapper with the same `with` /
+//! `with_mut` as loom, **keeping the call sites (`mpsc` / `spsc`) as a single body of code**.
 //!
-//! Miri が UB(未定義動作)を見るのに対し、Loom は**順序と可視性**を見る ── 役割が違うので両方要る。
+//! Whereas Miri looks at UB (undefined behavior), Loom looks at **ordering and visibility** ──
+//! different roles, so both are needed.
 //!
-//! cfg 名が `loom` ではなく `aetherflow_loom` なのは、`RUSTFLAGS` の `--cfg` が**依存クレート全体に
-//! 伝播する**ため。素の `--cfg loom` を使うと、自前の `cfg(loom)` 経路を持つが loom を依存に持たない
-//! クレート(dev-dependencies 経由の `concurrent-queue` 等)が壊れる。crossbeam が
-//! `crossbeam_loom` を使うのと同じ回避策。
+//! The cfg is named `aetherflow_loom` rather than `loom` because `RUSTFLAGS`'s `--cfg`
+//! **propagates to all dependency crates**. Using a bare `--cfg loom` would break crates that
+//! have their own `cfg(loom)` paths but do not depend on loom (e.g. `concurrent-queue` via
+//! dev-dependencies). This is the same workaround crossbeam uses with `crossbeam_loom`.
 
 #[cfg(aetherflow_loom)]
 pub(crate) use loom::cell::UnsafeCell;
@@ -28,10 +30,11 @@ pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(aetherflow_loom))]
 pub(crate) use std::sync::Arc;
 
-/// `std` 版 `UnsafeCell`(loom と同じ `with` / `with_mut` API に揃えるためのラッパ)。
+/// The `std` version of `UnsafeCell` (a wrapper to match loom's `with` / `with_mut` API).
 ///
-/// 呼び出し側を loom 版と同一に保つためだけの存在で、`#[inline(always)]` により
-/// 通常ビルドでは素の `UnsafeCell::get()` と同じコードに落ちる(ゼロコスト)。
+/// It exists solely to keep the call sites identical to the loom version, and thanks to
+/// `#[inline(always)]` it compiles down to the same code as a bare `UnsafeCell::get()` in
+/// ordinary builds (zero cost).
 #[cfg(not(aetherflow_loom))]
 #[derive(Debug)]
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
@@ -42,9 +45,9 @@ impl<T> UnsafeCell<T> {
         UnsafeCell(std::cell::UnsafeCell::new(data))
     }
 
-    /// 読み書きとも `with_mut` に寄せている(スロットへのアクセスは常に
-    /// 「単一スレッドが排他的に触る」規律の下でのみ行うため)。loom 版にある
-    /// 共有アクセス用の `with` は現状 呼び出しが無いので、ラッパ側にも生やさない。
+    /// Both reads and writes go through `with_mut` (because slot access is always performed under
+    /// the discipline that "a single thread touches it exclusively"). The `with` for shared access
+    /// present in the loom version currently has no callers, so we do not add it to the wrapper either.
     #[inline(always)]
     pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
         f(self.0.get())

@@ -1,64 +1,65 @@
-//! 単一生産者・単一消費者(SPSC)の有界リングバッファ。
+//! A single-producer, single-consumer (SPSC) bounded ring buffer.
 //!
-//! design.md 柱③の「コアを跨がない SPSC mailbox」の実体。ロックを一切使わず、
-//! head/tail の atomic を Acquire/Release でやり取りするだけの Lamport 型キュー。
+//! The concrete realization of pillar ③ in design.md, the "SPSC mailbox that never crosses
+//! cores". A Lamport-style queue that uses no locks and merely exchanges the head/tail atomics
+//! via Acquire/Release.
 //!
-//! 設計の要点(mechanical sympathy):
-//! - **単一ライター原則**: `tail` は生産者だけが書き、`head` は消費者だけが書く。
-//! - **false sharing 回避**: `head` と `tail` を別キャッシュライン(64B)に隔離。
-//!   同居すると、片方の更新が他方のキャッシュを無効化して無駄が出る(concepts-explained 参照)。
-//! - **有界**: 満杯時は `Full` を返してバックプレッシャ。無限バッファでメモリを溶かさない。
+//! Design highlights (mechanical sympathy):
+//! - **Single-writer principle**: only the producer writes `tail`, only the consumer writes `head`.
+//! - **False-sharing avoidance**: `head` and `tail` are isolated onto separate cache lines (64B).
+//!   If they shared one, an update to either would invalidate the other's cache, wasting work (see concepts-explained).
+//! - **Bounded**: when full, returns `Full` for backpressure. No unbounded buffer melting memory.
 
 use crate::sync::{Arc, AtomicBool, AtomicUsize, Ordering, UnsafeCell};
 use std::mem::MaybeUninit;
 
-/// 64 バイト境界に整列させ、隣接フィールドとのキャッシュライン共有(false sharing)を防ぐ。
+/// Align to a 64-byte boundary to prevent cache-line sharing (false sharing) with adjacent fields.
 #[repr(align(64))]
 struct CachePadded<T>(T);
 
 struct Ring<T> {
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
     cap: usize,
-    /// 消費者が次に読む位置(単調増加)。消費者のみが書く。
+    /// The position the consumer reads next (monotonically increasing). Only the consumer writes it.
     head: CachePadded<AtomicUsize>,
-    /// 生産者が次に書く位置(単調増加)。生産者のみが書く。
+    /// The position the producer writes next (monotonically increasing). Only the producer writes it.
     tail: CachePadded<AtomicUsize>,
-    /// 生産者(`Producer`)が drop されたら true。消費者の停止条件。
+    /// true once the producer (`Producer`) is dropped. The consumer's stop condition.
     closed: AtomicBool,
 }
 
-// スロットへのアクセスは head/tail の規律で単一スレッドに限定されるため安全。
+// Safe because slot access is confined to a single thread by the head/tail discipline.
 unsafe impl<T: Send> Send for Ring<T> {}
 unsafe impl<T: Send> Sync for Ring<T> {}
 
 impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
-        // 未消費のまま残っているスロット(head..tail)を drop する。
-        // &mut self = 他スレッドは存在しないので relaxed で十分(loom の atomic には
-        // get_mut が無いため、両ビルドで同一に保てる load を使う)。
+        // Drop the slots (head..tail) still holding unconsumed items.
+        // &mut self = no other thread exists, so relaxed suffices (loom's atomics have no
+        // get_mut, so use a load that stays identical across both builds).
         let head = self.head.0.load(Ordering::Relaxed);
         let tail = self.tail.0.load(Ordering::Relaxed);
         for pos in head..tail {
             let idx = pos % self.cap;
-            // 未初期化スロットには触れない(head..tail のみが初期化済み)。
+            // Do not touch uninitialized slots (only head..tail are initialized).
             self.slots[idx].with_mut(|p| unsafe { (*p).assume_init_drop() });
         }
     }
 }
 
-/// 送信端。単一生産者のみ(SPSC の S)。`Clone` は実装しない = 単一ライター原則の型による強制。
+/// The sending end. Single producer only (the S in SPSC). Does not implement `Clone` = the single-writer principle enforced by the type.
 pub struct Producer<T> {
     ring: Arc<Ring<T>>,
 }
 
-/// 受信端。単一消費者のみ。
+/// The receiving end. Single consumer only.
 pub struct Consumer<T> {
     ring: Arc<Ring<T>>,
 }
 
 pub use crate::TrySendError;
 
-/// 容量 `capacity`(1 以上)の SPSC リングを作る。
+/// Create an SPSC ring with capacity `capacity` (at least 1).
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     assert!(capacity >= 1, "SPSC capacity must be >= 1");
     let mut slots = Vec::with_capacity(capacity);
@@ -79,30 +80,30 @@ pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
 }
 
 impl<T> Producer<T> {
-    /// アイテムを move で押し込む。満杯なら `Err(TrySendError::Full(item))`。
-    /// (SPSC は単一生産者のため Closed は生じない。)
+    /// Push an item by move. Returns `Err(TrySendError::Full(item))` if full.
+    /// (Closed never arises in SPSC because there is a single producer.)
     pub fn try_push(&self, item: T) -> Result<(), TrySendError<T>> {
         let ring = &self.ring;
-        // tail は生産者のみが書くので Relaxed で自分の値を読める。
+        // Only the producer writes tail, so Relaxed can read our own value.
         let tail = ring.tail.0.load(Ordering::Relaxed);
-        // 消費者の進捗を Acquire で観測(空きスロットの可視性を得る)。
+        // Observe the consumer's progress via Acquire (gaining visibility of free slots).
         let head = ring.head.0.load(Ordering::Acquire);
         if tail - head == ring.cap {
             return Err(TrySendError::Full(item));
         }
         let idx = tail % ring.cap;
         ring.slots[idx].with_mut(|p| unsafe { (*p).write(item) });
-        // 書き込み完了を公開。消費者はこの Release と同期して item を読む。
+        // Publish that the write is complete. The consumer reads the item in sync with this Release.
         ring.tail.0.store(tail + 1, Ordering::Release);
         Ok(())
     }
 
-    /// 満杯の間スピンして押し込む(バックプレッシャ)。消費者が drain していれば必ず通る。
+    /// Spin while full and push (backpressure). Always succeeds as long as the consumer is draining.
     pub fn push_blocking(&self, mut item: T) {
         loop {
             match self.try_push(item) {
                 Ok(()) => return,
-                // SPSC は Closed を生じない(単一生産者)。満杯は空くまで待つ。
+                // SPSC never produces Closed (single producer). When full, wait until space opens.
                 Err(TrySendError::Full(returned)) | Err(TrySendError::Closed(returned)) => {
                     item = returned;
                     std::hint::spin_loop();
@@ -119,30 +120,30 @@ impl<T> Drop for Producer<T> {
 }
 
 impl<T> Consumer<T> {
-    /// アイテムを 1 つ取り出す。空なら `None`。
+    /// Take one item. Returns `None` if empty.
     pub fn try_pop(&self) -> Option<T> {
         let ring = &self.ring;
-        // head は消費者のみが書くので Relaxed。
+        // Only the consumer writes head, so Relaxed.
         let head = ring.head.0.load(Ordering::Relaxed);
-        // 生産者の進捗を Acquire で観測(書き込み済みデータの可視性を得る)。
+        // Observe the producer's progress via Acquire (gaining visibility of the written data).
         let tail = ring.tail.0.load(Ordering::Acquire);
         if head == tail {
             return None;
         }
         let idx = head % ring.cap;
         let item = ring.slots[idx].with_mut(|p| unsafe { (*p).assume_init_read() });
-        // スロットを空けたことを公開。
+        // Publish that the slot has been freed.
         ring.head.0.store(head + 1, Ordering::Release);
         Some(item)
     }
 
-    /// 生産者が drop 済みか(= もう新しいメッセージは来ない)。
+    /// Whether the producer has been dropped (= no more messages will arrive).
     pub fn is_closed(&self) -> bool {
         self.ring.closed.load(Ordering::Acquire)
     }
 }
 
-// loom ビルドでは loom 型をモデル外で触れないため、通常テストは対象外にする。
+// In loom builds, loom types cannot be touched outside the model, so exclude the ordinary tests.
 #[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
@@ -194,7 +195,7 @@ mod tests {
             let (tx, _rx) = channel::<Tracked>(4);
             tx.try_push(Tracked).ok();
             tx.try_push(Tracked).ok();
-            // 消費せずにスコープ終了 → Ring の Drop が残り 2 個を drop するはず。
+            // Scope ends without consuming → Ring's Drop should drop the remaining 2.
         }
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
     }
@@ -218,7 +219,7 @@ mod tests {
         let mut next = 0u64;
         while next < 100_000 {
             if let Some(v) = rx.try_pop() {
-                assert_eq!(v, next); // FIFO・ロスなしを確認
+                assert_eq!(v, next); // verify FIFO with no loss
                 next += 1;
             } else {
                 std::hint::spin_loop();
@@ -228,25 +229,25 @@ mod tests {
     }
 }
 
-/// Loom による並行インターリーブ検証(`RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib` でのみ動く)。
+/// Concurrent interleaving verification with Loom (only runs under `RUSTFLAGS="--cfg aetherflow_loom" cargo test --lib`).
 ///
-/// SPSC は「単一ライター原則」(tail は生産者だけ、head は消費者だけが書く)に依存しており、
-/// 正しさは head/tail の Acquire/Release だけで担保される。その担保が本当に効いているかを
-/// 順序の網羅探索で確かめる。
+/// SPSC relies on the "single-writer principle" (only the producer writes tail, only the consumer
+/// writes head), and correctness is guaranteed by the head/tail Acquire/Release alone. We confirm
+/// that this guarantee truly holds via exhaustive exploration of the orderings.
 #[cfg(all(test, aetherflow_loom))]
 mod loom_tests {
     use super::*;
     use loom::thread;
 
-    /// **リングの周回**: 容量 1 に 2 通を通す(1 通目が消費されるまで 2 通目は Full)。
-    /// 満杯→消費→再利用のハンドシェイクが、どの順序でも値を壊さないこと。
+    /// **Ring wraparound**: push 2 messages through capacity 1 (the 2nd is Full until the 1st is consumed).
+    /// The full→consume→reuse handshake must not corrupt values under any ordering.
     #[test]
     fn wraparound_preserves_values_and_order() {
         loom::model(|| {
             let (tx, rx) = channel::<u32>(1);
 
             let h = thread::spawn(move || {
-                // Full の間は譲って再試行(push_blocking と同じ理屈を明示的に書く)。
+                // While Full, yield and retry (spelling out the same logic as push_blocking).
                 for i in 1..=2u32 {
                     loop {
                         match tx.try_push(i) {
@@ -266,12 +267,13 @@ mod loom_tests {
                 }
             }
             h.join().unwrap();
-            assert_eq!(got, vec![1, 2], "FIFO 順序が保たれること(スロット再利用込み)");
+            assert_eq!(got, vec![1, 2], "FIFO order is preserved (including slot reuse)");
         });
     }
 
-    /// **生産者消滅の公開**: `Producer` が drop されたら消費者は `is_closed` で観測でき、
-    /// かつ drop 前に送った値は失われない(閉じたことが先に見えて値が見えない、が無い)。
+    /// **Publishing producer teardown**: once `Producer` is dropped, the consumer can observe it via
+    /// `is_closed`, and values sent before the drop are not lost (no case where closure becomes visible
+    /// first while the value is not).
     #[test]
     fn close_is_visible_after_pending_value() {
         loom::model(|| {
@@ -279,12 +281,12 @@ mod loom_tests {
 
             let h = thread::spawn(move || {
                 tx.try_push(7).ok();
-                drop(tx); // closed = true を公開
+                drop(tx); // publish closed = true
             });
             h.join().unwrap();
 
-            assert!(rx.is_closed(), "生産者消滅が観測できること");
-            assert_eq!(rx.try_pop(), Some(7), "閉じても未消費の値は残ること");
+            assert!(rx.is_closed(), "producer teardown is observable");
+            assert_eq!(rx.try_pop(), Some(7), "unconsumed values remain even after closing");
         });
     }
 }

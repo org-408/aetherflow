@@ -1,13 +1,15 @@
-//! I/O as messages — `Connection` 表面(DRAFT / feature `net`)。
+//! I/O as messages — the `Connection` surface (DRAFT / feature `net`).
 //!
-//! `docs/io-surface-design.md` の表面を、まず **ポータブルな参照バックエンド**で実装したもの。
-//! ユーザーは socket を read/write せず、**届いたバイトを `on_data`(=メッセージ)で受け、送信は
-//! 非ブロッキングの [`Io`] handle へ append** する。ハンドラは同期 run-to-completion、await 無し・
-//! 関数の色無し・`Pin` 無し。
+//! An implementation of the surface described in `docs/io-surface-design.md`, first realized on a
+//! **portable reference backend**. The user never reads/writes the socket directly: instead they
+//! **receive incoming bytes via `on_data` (= a message) and append outbound data to the
+//! nonblocking [`Io`] handle**. Handlers are synchronous run-to-completion — no await, no function
+//! coloring, no `Pin`.
 //!
-//! **このバックエンドは参照実装**(nonblocking socket を1スレッドで回すだけ)であって、本命の
-//! **busy-poll(各コアが socket を回す・Linux)ではない**。目的は「表面 API を macOS で compile &
-//! test して確定させる」こと。性能版(`System::listen` への統合 + busy-poll reactor)は Linux で後追い。
+//! **This backend is a reference implementation** (a single thread spinning a nonblocking socket),
+//! not the intended **busy-poll design (each core spinning its own socket, on Linux)**. Its purpose
+//! is to compile & test the surface API on macOS and lock it down. The performance version
+//! (integration into `System::listen` + a busy-poll reactor) will follow on Linux.
 //!
 //! ```no_run
 //! use aetherflow::net::{serve, Connection, Io};
@@ -16,7 +18,7 @@
 //!     fn on_data(&mut self, buf: &[u8], io: &mut Io) { io.write(buf); }
 //! }
 //! let server = serve("127.0.0.1:0", || Echo).unwrap();
-//! // ... server.local_addr() へ接続 ...
+//! // ... connect to server.local_addr() ...
 //! server.shutdown();
 //! ```
 
@@ -27,25 +29,29 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-/// 接続ハンドラ。**接続1つにつき1インスタンス**。状態はフィールドに持つ(単一所有、`Arc`/`Mutex` 不要)。
+/// A connection handler. **One instance per connection**. State lives in its fields (single
+/// ownership, no `Arc`/`Mutex` needed).
 ///
-/// 必須は [`on_data`](Connection::on_data) だけ。I/O は「メッセージの発生源」= ランタイムが socket を
-/// 読んで `on_data` を呼ぶ。ユーザーは read を書かない。
+/// Only [`on_data`](Connection::on_data) is required. I/O is the "source of messages" = the runtime
+/// reads the socket and calls `on_data`. The user never writes a read loop.
 pub trait Connection: Send + 'static {
-    /// 接続が開いた直後。ハンドシェイクの初手などに使う(任意)。
+    /// Called right after the connection opens. Use it for the first step of a handshake, etc.
+    /// (optional).
     fn on_open(&mut self, _io: &mut Io) {}
 
-    /// バイトが届いた。`buf` は**分割で届きうる**(TCP はストリーム)。フレーム境界が要るなら
-    /// [`FramedConnection`] を使う。
+    /// Bytes arrived. `buf` **may arrive in pieces** (TCP is a stream). If you need frame
+    /// boundaries, use [`FramedConnection`].
     fn on_data(&mut self, buf: &[u8], io: &mut Io);
 
-    /// 接続が閉じた(相手クローズ or エラー or `io.close()`)。集計・後始末に使う(任意)。
+    /// The connection closed (peer close, error, or `io.close()`). Use it for aggregation and
+    /// cleanup (optional).
     fn on_close(&mut self) {}
 }
 
-/// 送信 handle。`write` は**非ブロッキング**(内部バッファへ append、reactor が socket へ書き出す)。
-/// await しない。基本パスでは失敗しない(満杯時はバッファする)。厳密な flow control は上級 API で
-/// 別途(このドラフトでは未実装)。
+/// The outbound handle. `write` is **nonblocking** (append to an internal buffer; the reactor
+/// writes it out to the socket). It never awaits. On the basic path it never fails (when full, it
+/// buffers). Strict flow control is a separate concern for a higher-level API (not implemented in
+/// this draft).
 #[derive(Default)]
 pub struct Io {
     out: Vec<u8>,
@@ -53,31 +59,32 @@ pub struct Io {
 }
 
 impl Io {
-    /// 送信データを積む(非ブロッキング)。実際の socket 書き込みは reactor が行う。
+    /// Queue outbound data (nonblocking). The actual socket write is performed by the reactor.
     pub fn write(&mut self, bytes: &[u8]) {
         self.out.extend_from_slice(bytes);
     }
 
-    /// 送信バッファを出し切ってから接続を閉じるよう予約する。
+    /// Schedule the connection to close once the outbound buffer has been fully flushed.
     pub fn close(&mut self) {
         self.close = true;
     }
 
-    /// まだ送り出していないバイト数(テスト・観測用)。
+    /// Number of bytes not yet sent out (for tests and observation).
     pub fn pending(&self) -> usize {
         self.out.len()
     }
 }
 
-// ───────────────────────── framing(定型プロトコルの状態機械をランタイムに寄せる) ─────────────────
+// ───────────────────────── framing (move the boilerplate protocol state machine into the runtime) ─────────────────
 
-/// バイト列からフレームを切り出す規則。`decode` は先頭から1フレーム取れれば `Some(frame)` を返し、
-/// その分を `buf` から消費する。足りなければ `None`(次の `on_data` を待つ)。
+/// A rule for carving frames out of a byte stream. If `decode` can take one whole frame from the
+/// front, it returns `Some(frame)` and consumes those bytes from `buf`. If there isn't enough, it
+/// returns `None` (wait for the next `on_data`).
 pub trait Codec: Default + Send + 'static {
     fn decode(&mut self, buf: &mut Vec<u8>) -> Option<Vec<u8>>;
 }
 
-/// 4バイト BE の長さプレフィックス + 本文。
+/// A 4-byte big-endian length prefix followed by the payload.
 #[derive(Default)]
 pub struct LengthPrefixed;
 
@@ -96,7 +103,8 @@ impl Codec for LengthPrefixed {
     }
 }
 
-/// 改行(`\n`)区切り。返すフレームには改行を含めない(末尾 `\r` も落とす)。
+/// Newline (`\n`) delimited. The returned frame excludes the newline (a trailing `\r` is also
+/// stripped).
 #[derive(Default)]
 pub struct Lines;
 
@@ -107,13 +115,13 @@ impl Codec for Lines {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        buf.drain(..=pos); // 改行も消費
+        buf.drain(..=pos); // consume the newline too
         Some(line)
     }
 }
 
-/// フレーム単位で受け取るハンドラ。`on_frame` は**必ず1フレーム丸ごと**で呼ばれる = 手書き状態機械が
-/// 消える(design.md §2.5 の shallow surface)。
+/// A handler that receives data one frame at a time. `on_frame` is **always called with one whole
+/// frame** = the hand-written state machine disappears (the shallow surface of design.md §2.5).
 pub trait FramedConnection: Send + 'static {
     type Codec: Codec;
     fn on_open(&mut self, _io: &mut Io) {}
@@ -121,7 +129,8 @@ pub trait FramedConnection: Send + 'static {
     fn on_close(&mut self) {}
 }
 
-/// [`FramedConnection`] を素の [`Connection`] に変換するアダプタ。`serve(addr, || Framed::new(Proto))`。
+/// An adapter that turns a [`FramedConnection`] into a plain [`Connection`].
+/// `serve(addr, || Framed::new(Proto))`.
 pub struct Framed<F: FramedConnection> {
     inner: F,
     codec: F::Codec,
@@ -153,10 +162,10 @@ impl<F: FramedConnection> Connection for Framed<F> {
     }
 }
 
-// ───────────────────────── 参照 reactor(移植性優先。busy-poll 性能版ではない) ─────────────────────
+// ───────────────────────── reference reactor (portability first; not the busy-poll performance version) ─────────────────────
 
-/// 起動中のサーバへのハンドル。`local_addr()` で待受アドレス、`shutdown()` で全 reactor を停止。
-/// thread-per-core([`serve_on_cores`])では reactor スレッドを複数保持する。
+/// A handle to a running server. `local_addr()` gives the listen address; `shutdown()` stops all
+/// reactors. In thread-per-core mode ([`serve_on_cores`]) it holds multiple reactor threads.
 pub struct ServerHandle {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -164,12 +173,12 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    /// 待受アドレス(`serve*` に渡したもの / `:0` の場合は割当済みポート)。
+    /// The listen address (as passed to `serve*`; for `:0`, the actually assigned port).
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// 全 reactor を止めて join する。
+    /// Stop all reactors and join them.
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::Release);
         for j in self.joins.drain(..) {
@@ -194,8 +203,8 @@ struct Conn<C: Connection> {
 }
 
 impl<C: Connection> Conn<C> {
-    /// 送信バッファを可能な範囲で socket へ書き出す(nonblocking。詰まったら残す)。
-    /// 相手切断などの致命エラーなら Err。
+    /// Write as much of the outbound buffer to the socket as possible (nonblocking; leave the rest
+    /// if it stalls). Returns Err on a fatal error such as the peer disconnecting.
     fn try_flush(&mut self) -> io::Result<()> {
         while !self.io.out.is_empty() {
             match self.stream.write(&self.io.out) {
@@ -211,13 +220,14 @@ impl<C: Connection> Conn<C> {
         Ok(())
     }
 
-    /// close 予約済みで送信も出し切ったか。
+    /// Whether a close was scheduled and all outbound data has been flushed.
     fn closing_done(&self) -> bool {
         self.io.close && self.io.out.is_empty()
     }
 
-    /// on_data 後 / 読むもの無し時に共通で走る後処理: 送信を出し切り、致命エラー or close 完了なら
-    /// `on_close` を呼んで「この接続を落とす」= true を返す。
+    /// Common post-processing that runs after on_data / when there is nothing to read: flush the
+    /// outbound data, and on a fatal error or a completed close call `on_close` and return true to
+    /// signal "drop this connection".
     fn service(&mut self) -> bool {
         if self.try_flush().is_err() || self.closing_done() {
             self.handler.on_close();
@@ -227,29 +237,37 @@ impl<C: Connection> Conn<C> {
     }
 }
 
-/// reactor の回し方。同じ nonblocking コードを、開発機では控えめに、専有コアでは busy-poll で回す。
+/// How to spin the reactor. The same nonblocking code runs modestly on a dev machine and busy-polls
+/// on a dedicated core.
 ///
-/// 既定(`Default`)は移植性・開発優先 = `busy_poll: false`(各周回で短く sleep)・`pin_core: None`。
-/// busy-poll + ピン留めは明示 opt-in(専有コアの低レイテンシ経路)。
+/// The default (`Default`) favors portability and development = `busy_poll: false` (a short sleep
+/// each iteration) and `pin_core: None`. Busy-poll + pinning is explicit opt-in (the low-latency
+/// path on a dedicated core).
 #[derive(Clone, Copy, Default)]
 pub struct ServeOptions {
-    /// `true`: sleep せず回し続ける = **busy-poll**(低レイテンシ・専有コア前提。Linux 実測の性能経路)。
-    /// `false`(既定): 各周回で短く sleep = 参照/開発用(共有機で CPU を焼かない)。
+    /// `true`: keep spinning without sleeping = **busy-poll** (low latency, assumes a dedicated
+    /// core; the measured performance path on Linux).
+    /// `false` (default): a short sleep each iteration = reference/development use (don't burn CPU
+    /// on a shared machine).
     pub busy_poll: bool,
-    /// `Some(core)`: reactor スレッドをそのコアへ best-effort ピン留め(busy-poll と対で効く)。
+    /// `Some(core)`: best-effort pin the reactor thread to that core (pairs with busy-poll).
     pub pin_core: Option<usize>,
-    /// `true` **かつ Linux**: 全 fd スキャンでなく **epoll(readiness)** で ready な fd だけ捌く = O(ready)。
-    /// `busy_poll` と併用すると epoll_wait を timeout=0 で回す(park しない)。非 Linux では無視(scan)。
+    /// `true` **and on Linux**: instead of scanning all fds, use **epoll (readiness)** to service
+    /// only the ready fds = O(ready). Combined with `busy_poll`, epoll_wait is called with
+    /// timeout=0 (no park). Ignored on non-Linux (scan).
     ///
-    /// **既定は `false`(scan)を推奨。** 実測(8 vCPU, AWS c7g)では、サーバコアが飽和しない範囲
-    /// (〜256接続)では **scan busy-poll の方が速い**(epoll_wait の syscall が純オーバーヘッドになる)。
-    /// epoll の O(ready) 優位は**超高 fd 数(数千接続)**で初めて効くはずだが、そこは未実証(要 harness 改善)。
-    /// 現状 epoll が明確に勝るのは「低接続の tail の平坦さ」のみ。`docs/io-surface-design.md` §7.5 参照。
+    /// **The default `false` (scan) is recommended.** In measurements (8 vCPU, AWS c7g), as long as
+    /// the server core isn't saturated (up to ~256 connections), **scan busy-poll is faster** (the
+    /// epoll_wait syscall becomes pure overhead). Epoll's O(ready) advantage should only start to
+    /// matter at **very high fd counts (thousands of connections)**, but that is unproven (needs
+    /// harness improvements). At present epoll clearly wins only on "the flatness of the tail at low
+    /// connection counts". See `docs/io-surface-design.md` §7.5.
     pub epoll: bool,
 }
 
-/// サーバを起動する(既定オプション = 参照/開発用)。`addr` に bind し、接続ごとに `factory()` で
-/// ハンドラを1つ作る。低レイテンシの性能経路は [`serve_with`] に [`ServeOptions`] を渡す。
+/// Start a server (default options = reference/development use). Binds to `addr` and creates one
+/// handler per connection via `factory()`. For the low-latency performance path, pass
+/// [`ServeOptions`] to [`serve_with`].
 pub fn serve<A, F, C>(addr: A, factory: F) -> io::Result<ServerHandle>
 where
     A: ToSocketAddrs,
@@ -259,11 +277,13 @@ where
     serve_with(addr, factory, ServeOptions::default())
 }
 
-/// [`serve`] にオプションを付けた版。busy-poll + コアピン留めで**専有コアの低レイテンシ経路**にする。
+/// [`serve`] with options. Busy-poll + core pinning turns it into the **low-latency path on a
+/// dedicated core**.
 ///
-/// 同じ nonblocking reactor を、`busy_poll` で「sleep せず回し続ける」に切り替えるだけ ── busy-spin の
-/// 思想を I/O へ延長したもの。低コネクション・低レイテンシ slice では fd を舐め続けるのが最適
-/// (epoll は高コネクション向け=別 slice)。
+/// It simply switches the same nonblocking reactor to "keep spinning without sleeping" via
+/// `busy_poll` — extending the busy-spin philosophy to I/O. In the low-connection, low-latency
+/// slice, continuously scanning the fds is optimal (epoll targets high connection counts = a
+/// different slice).
 pub fn serve_with<A, F, C>(addr: A, factory: F, opts: ServeOptions) -> io::Result<ServerHandle>
 where
     A: ToSocketAddrs,
@@ -287,16 +307,18 @@ where
     })
 }
 
-/// **thread-per-core serve**: `cores` の各コアに 1 本の reactor スレッドを立て、それぞれが
-/// **SO_REUSEPORT** で同じ `addr` に bind した専用 listener を持つ。カーネルが着信接続を各 listener に
-/// 分散するので、接続が N コアに散り、各コアが自分の接続だけを回す(= AetherFlow の thread-per-core
-/// 思想を I/O へ。glommio の N executor と N 対 N でスケール比較できる)。
+/// **thread-per-core serve**: spin up one reactor thread on each core in `cores`, each holding its
+/// own listener bound to the same `addr` via **SO_REUSEPORT**. The kernel distributes incoming
+/// connections across the listeners, so connections spread over N cores and each core spins only its
+/// own connections (= AetherFlow's thread-per-core philosophy applied to I/O; enables an N-to-N
+/// scaling comparison against glommio's N executors).
 ///
-/// `factory` は接続ごとに 1 インスタンス作るので **`Clone`** が要る(各 reactor が自分用に持つ)。
-/// `opts.pin_core` は無視され、各 reactor は `cores[i]` にピン留めされる。
+/// `factory` creates one instance per connection, so it must be **`Clone`** (each reactor holds its
+/// own). `opts.pin_core` is ignored; each reactor is pinned to `cores[i]`.
 ///
-/// **注意**: SO_REUSEPORT で複数 listener を同居させるため `addr` は**具体ポート必須**(`:0` は各
-/// listener が別ポートになり分散にならない)。Unix 専用(SO_REUSEPORT)。
+/// **Note**: because multiple listeners coexist via SO_REUSEPORT, `addr` **must be a concrete port**
+/// (`:0` would give each listener a different port and defeat the distribution). Unix only
+/// (SO_REUSEPORT).
 pub fn serve_on_cores<A, F, C>(
     addr: A,
     cores: &[usize],
@@ -331,8 +353,8 @@ where
     Ok(ServerHandle { addr, stop, joins })
 }
 
-/// SO_REUSEPORT + SO_REUSEADDR を立てた nonblocking listener を addr に bind する
-/// (複数コアが同じ addr で並行 accept できる)。
+/// Bind a nonblocking listener to addr with SO_REUSEPORT + SO_REUSEADDR set (so multiple cores can
+/// accept concurrently on the same addr).
 fn reuseport_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv4() {
@@ -355,7 +377,7 @@ where
     F: Fn() -> C,
     C: Connection,
 {
-    // Linux で epoll 指定なら readiness reactor へ。それ以外は移植性 scan reactor。
+    // On Linux with epoll requested, use the readiness reactor. Otherwise the portable scan reactor.
     #[cfg(target_os = "linux")]
     if opts.epoll {
         epoll_reactor(listener, factory, stop, opts);
@@ -364,8 +386,9 @@ where
     scan_reactor(listener, factory, stop, opts);
 }
 
-/// 移植性 scan reactor: 全接続を nonblocking で舐める。低コネクション・低レイテンシに最適
-/// (epoll_wait の syscall が無い)。高並行では O(接続数)スキャンで tail が伸びる → Linux は epoll。
+/// Portable scan reactor: scan all connections nonblockingly. Optimal for low connection counts and
+/// low latency (no epoll_wait syscall). At high concurrency the O(connections) scan lengthens the
+/// tail → on Linux, use epoll.
 fn scan_reactor<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
 where
     F: Fn() -> C,
@@ -378,7 +401,7 @@ where
     let mut rbuf = [0u8; 4096];
 
     while !stop.load(Ordering::Acquire) {
-        // 1) accept できるだけ受ける
+        // 1) accept as many as we can
         loop {
             match listener.accept() {
                 Ok((stream, _peer)) => {
@@ -391,7 +414,7 @@ where
                         io: Io::default(),
                     };
                     conn.handler.on_open(&mut conn.io);
-                    // on_open の送信を出す。落とすべきでなければ接続リストへ。
+                    // Flush on_open's output. If it shouldn't be dropped, add it to the list.
                     if !conn.service() {
                         conns.push(conn);
                     }
@@ -402,13 +425,13 @@ where
             }
         }
 
-        // 2) 各接続を読む → on_data → flush
+        // 2) read each connection → on_data → flush
         let mut i = 0;
         while i < conns.len() {
             let mut remove = false;
             match conns[i].stream.read(&mut rbuf) {
                 Ok(0) => {
-                    // 相手クローズ
+                    // peer closed
                     conns[i].handler.on_close();
                     remove = true;
                 }
@@ -418,7 +441,7 @@ where
                     remove = conn.service();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // 読むものは無い。溜まった送信を出す試みだけする。
+                    // Nothing to read. Just attempt to flush any queued outbound data.
                     remove = conns[i].service();
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
@@ -434,8 +457,8 @@ where
             }
         }
 
-        // busy-poll: sleep せず回し続ける(専有コア前提の低レイテンシ経路)。
-        // 参照/開発: 各周回で短く休む(共有機で CPU を焼かない)。
+        // busy-poll: keep spinning without sleeping (the low-latency path assuming a dedicated core).
+        // reference/development: rest briefly each iteration (don't burn CPU on a shared machine).
         if opts.busy_poll {
             std::hint::spin_loop();
         } else {
@@ -444,10 +467,10 @@ where
     }
 }
 
-/// Linux epoll(readiness)reactor: ready な fd だけを捌く = O(ready)。高並行でも一部接続が
-/// スキャン待ちで飢えないので tail が締まる(glommio の io_uring と同じ発想)。`busy_poll` 時は
-/// epoll_wait を timeout=0 で回す(park しない)。level-triggered(EPOLLET なし)= 部分読みでも
-/// 次周回で再発火するので単純。
+/// Linux epoll (readiness) reactor: service only the ready fds = O(ready). Even at high concurrency
+/// no connection starves waiting for a scan, so the tail tightens (the same idea as glommio's
+/// io_uring). Under `busy_poll`, epoll_wait is called with timeout=0 (no park). Level-triggered (no
+/// EPOLLET) = simple, since a partial read re-fires on the next iteration.
 #[cfg(target_os = "linux")]
 fn epoll_reactor<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
 where
@@ -465,7 +488,7 @@ where
     assert!(epfd >= 0, "epoll_create1 failed");
     let listen_fd = listener.as_raw_fd();
 
-    // fd を epoll に (EPOLLIN|EPOLLOUT で) 登録/変更する小ヘルパ。
+    // Small helper to register/modify an fd in epoll (with EPOLLIN|EPOLLOUT).
     let ctl = |op: libc::c_int, fd: libc::c_int, want_out: bool| {
         let mut events = libc::EPOLLIN as u32;
         if want_out {
@@ -498,7 +521,7 @@ where
             let fd = ev.u64 as libc::c_int;
 
             if fd == listen_fd {
-                // 受けられるだけ accept(level-triggered なので残ればまた発火)。
+                // Accept as many as we can (level-triggered, so it re-fires if any remain).
                 loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
@@ -558,7 +581,7 @@ where
                             conn.handler.on_close();
                             remove = true;
                         } else {
-                            // 送信残があれば EPOLLOUT を要求、無ければ EPOLLIN のみ。
+                            // Request EPOLLOUT if outbound data remains, otherwise EPOLLIN only.
                             ctl(libc::EPOLL_CTL_MOD, fd, !conn.io.out.is_empty());
                         }
                     }
@@ -625,8 +648,8 @@ mod tests {
         let mut c = connect(server.local_addr());
         let mut buf = [0u8; 3];
         c.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"hi\n"); // on_open の送信が届く
-        drop(c); // 相手クローズ → on_close
+        assert_eq!(&buf, b"hi\n"); // on_open's output arrives
+        drop(c); // peer closes → on_close
         let t = std::time::Instant::now();
         while CLOSED.load(Ordering::SeqCst) == 0 && t.elapsed() < Duration::from_secs(2) {
             thread::sleep(Duration::from_millis(2));
@@ -637,7 +660,7 @@ mod tests {
 
     #[test]
     fn framed_lines_delivers_whole_frames() {
-        // 受け取ったフレーム(行)を記録し、大文字化して返す。分割送信でも1行=1フレーム。
+        // Record each received frame (line) and echo it back uppercased. Even with split sends, one line = one frame.
         static FRAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
         struct Upper;
         impl FramedConnection for Upper {
@@ -652,14 +675,14 @@ mod tests {
         let server = serve("127.0.0.1:0", || Framed::new(Upper)).unwrap();
         let mut c = connect(server.local_addr());
 
-        // わざと境界をまたいで送る: "foo\nba" then "r\n" → フレームは "foo","bar"
+        // Deliberately send across a boundary: "foo\nba" then "r\n" → frames are "foo","bar"
         c.write_all(b"foo\nba").unwrap();
         thread::sleep(Duration::from_millis(20));
         c.write_all(b"r\n").unwrap();
 
         let mut got = Vec::new();
         let mut tmp = [0u8; 64];
-        // "FOO\nBAR\n" = 8 bytes を読む
+        // read "FOO\nBAR\n" = 8 bytes
         let mut total = 0;
         while total < 8 {
             match c.read(&mut tmp) {
@@ -679,7 +702,7 @@ mod tests {
 
     #[test]
     fn multicore_reuseport_echo() {
-        // 2 コア(2 reactor + SO_REUSEPORT)で echo。複数クライアントが分散着信しても全員 echo が返る。
+        // Echo on 2 cores (2 reactors + SO_REUSEPORT). Even when multiple clients land on different reactors, everyone gets their echo.
         #[derive(Clone)]
         struct Echo;
         impl Connection for Echo {
@@ -687,10 +710,10 @@ mod tests {
                 io.write(buf);
             }
         }
-        // 具体ポート必須(:0 は reuseport で別ポートになる)。衝突回避のため高めの固定ポート。
+        // A concrete port is required (:0 would give different ports under reuseport). A high fixed port to avoid collisions.
         let addr = "127.0.0.1:19911";
         let server = serve_on_cores(addr, &[0, 1], || Echo, ServeOptions::default()).unwrap();
-        // 8 本つないでそれぞれ echo 確認(カーネルが 2 listener に分散する)。
+        // Open 8 connections and verify each echoes (the kernel distributes them across the 2 listeners).
         let mut clients: Vec<TcpStream> = (0..8).map(|_| connect(server.local_addr())).collect();
         for (i, c) in clients.iter_mut().enumerate() {
             let msg = format!("hello-{i}");
@@ -709,7 +732,7 @@ mod tests {
         impl FramedConnection for EchoFrame {
             type Codec = LengthPrefixed;
             fn on_frame(&mut self, frame: &[u8], io: &mut Io) {
-                // 受けたフレームを同じ length-prefixed で返す
+                // echo the received frame back with the same length prefix
                 io.write(&(frame.len() as u32).to_be_bytes());
                 io.write(frame);
             }

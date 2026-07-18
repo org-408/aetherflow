@@ -1,14 +1,15 @@
-//! pub/sub(一対多ブロードキャスト)— チャットルーム風。Hub が購読者全員に配る。
+//! pub/sub (one-to-many broadcast) — a chat-room style Hub that fans a message out to all subscribers.
 //!
 //!   cargo run --example pubsub
 //!
-//! ポイント: `ActorRef` は **Clone + Send** なので、**メッセージに載せて渡せる**(= 購読の登録)。
-//! Hub は購読者リストを単一所有で持ち、`Publish` を受けたら全員に **try_send**(非ブロッキング)で配る。
-//! handler の中から他 actor へ送るときは `try_send`(`send_blocking` は同一コアだとデッドロック)。
+//! Key idea: `ActorRef` is **Clone + Send**, so you can **pass it inside a message** (that's how you
+//! subscribe). The Hub keeps the subscriber list as single-owned state and, on `Publish`, delivers
+//! to everyone with **try_send** (non-blocking). From inside a handler, use `try_send` (`send_blocking`
+//! would deadlock on the same core).
 
 use aetherflow::{Actor, ActorRef, System};
 
-/// 購読者。受け取ったメッセージを自分の名前付きで表示するだけ。
+/// A subscriber. It just prints whatever message it receives, prefixed with its name.
 struct Subscriber {
     name: &'static str,
 }
@@ -19,14 +20,14 @@ impl Actor for Subscriber {
     }
 }
 
-/// ブロードキャスト Hub。購読者の送信ハンドルを保持し、Publish を全員に配る。
+/// The broadcast Hub. It holds subscriber send-handles and fans each Publish out to all of them.
 struct Hub {
     subscribers: Vec<ActorRef<Subscriber>>,
 }
 enum HubMsg {
-    /// 購読登録(ActorRef をメッセージに載せて渡す)。
+    /// Register a subscriber (its ActorRef is passed in the message).
     Subscribe(ActorRef<Subscriber>),
-    /// 全購読者へ配信。
+    /// Deliver to all subscribers.
     Publish(String),
 }
 impl Actor for Hub {
@@ -36,7 +37,7 @@ impl Actor for Hub {
             HubMsg::Subscribe(sub) => self.subscribers.push(sub),
             HubMsg::Publish(text) => {
                 for sub in &self.subscribers {
-                    // 非ブロッキング。相手が満杯/消滅なら握りつぶす(pub/sub の best-effort 配信)。
+                    // Non-blocking; drop on full/gone (best-effort pub/sub delivery).
                     let _ = sub.try_send(text.clone());
                 }
             }
@@ -54,18 +55,18 @@ fn main() {
         },
     );
 
-    // 3 人の購読者を立てて Hub に登録(ハンドルをメッセージで渡す)。
+    // Spawn 3 subscribers and register them with the Hub (passing the handle in a message).
     for name in ["alice", "bob", "carol"] {
         let sub = sys.spawn_on(0, Subscriber { name });
         hub.send_blocking(HubMsg::Subscribe(sub)).unwrap();
     }
 
-    // 配信すると全員に届く。
+    // A publish reaches everyone.
     println!("publishing 2 messages to 3 subscribers:");
     hub.send_blocking(HubMsg::Publish("hello everyone".into())).unwrap();
     hub.send_blocking(HubMsg::Publish("meeting at 3pm".into())).unwrap();
 
     drop(hub);
-    sys.shutdown(); // drain してから停止 = 全配信が処理される
+    sys.shutdown(); // drain then stop = every delivery is processed
     println!("ok");
 }

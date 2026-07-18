@@ -1,18 +1,23 @@
-//! ゼロアロケーション request-reply(`ask`)。
+//! Zero-allocation request-reply (`ask`).
 //!
-//! kameo/tokio の `ask` は**呼び出しごとに reply チャネル(oneshot)を heap 確保**する。これが
-//! ask の隠れコストで、フレームワーク越しの ask が遅い一因。
+//! The `ask` in kameo/tokio **heap-allocates a reply channel (oneshot) on every
+//! call**. That is the hidden cost of `ask`, and one reason `ask` through a
+//! framework is slow.
 //!
-//! 本実装は reply cell を**呼び出し側のスタック**に置き、[`Responder`] に生ポインタで渡す。
-//! 呼び出し側は返事が来るまでブロックするので、**cell の生存はブロック期間中に保証される** →
-//! heap 確保ゼロ。生ポインタを使うのは、メッセージ(`A::Message: Send + 'static`)に借用を載せ
-//! られないため。安全性は「呼び出し側がブロックして cell を生かし続ける」プロトコルで担保する。
+//! This implementation places the reply cell on the **caller's stack** and hands
+//! it to [`Responder`] as a raw pointer. The caller blocks until the reply
+//! arrives, so **the cell is guaranteed to stay alive for the duration of the
+//! block** → zero heap allocation. The raw pointer is needed because the message
+//! (`A::Message: Send + 'static`) cannot carry a borrow. Safety is upheld by the
+//! protocol that "the caller blocks and keeps the cell alive."
 //!
-//! [`Responder`] は **一度だけ返信できる線形トークン**(`reply` が self を consume)= iso 的。
-//! 返信せず捨てられたら、呼び出し側は [`AskError::NoReply`] で起きる(デッドロックしない)。
+//! [`Responder`] is a **linear token that can reply exactly once** (`reply`
+//! consumes self) = iso-like. If it is dropped without replying, the caller wakes
+//! up with [`AskError::NoReply`] (no deadlock).
 //!
-//! **制約**: `ask` は呼び出しスレッドをブロックする。**handler の中から同一コアの actor へ ask
-//! するとデッドロック**(send_blocking と同じ)。runtime の外(main / I/O スレッド)から使うこと。
+//! **Constraint**: `ask` blocks the calling thread. **Asking an actor on the same
+//! core from within a handler deadlocks** (same as `send_blocking`). Use it from
+//! outside the runtime (the main / I/O threads).
 
 use crate::{Actor, ActorRef, SendError};
 use std::cell::UnsafeCell;
@@ -24,7 +29,7 @@ const PENDING: u8 = 0;
 const REPLIED: u8 = 1;
 const ABANDONED: u8 = 2;
 
-/// 呼び出し側スタックに置かれる返信スロット。actor が書き、呼び出し側が読む。
+/// Reply slot placed on the caller's stack. The actor writes it, the caller reads it.
 struct ReplyCell<R> {
     state: AtomicU8,
     slot: UnsafeCell<MaybeUninit<R>>,
@@ -39,34 +44,36 @@ impl<R> ReplyCell<R> {
     }
 }
 
-/// 一度だけ返信できる線形トークン(iso 的)。`reply` が self を consume する。
+/// Linear token that can reply exactly once (iso-like). `reply` consumes self.
 pub struct Responder<R> {
     cell: *const ReplyCell<R>,
 }
 
-// cell へのアクセスは state atomic(Release/Acquire)で単一 writer/reader に同期される。
-// R: Send なら別コアへ渡して安全。
+// Access to the cell is synchronized to a single writer/reader via the state
+// atomic (Release/Acquire). If R: Send, it is safe to hand across cores.
 unsafe impl<R: Send> Send for Responder<R> {}
 
 impl<R> Responder<R> {
-    /// 返信する(トークンを消費)。
+    /// Reply (consumes the token).
     pub fn reply(self, value: R) {
-        // SAFETY: 呼び出し側が REPLIED を Acquire で観測するまでブロックしており、cell は生存。
+        // SAFETY: the caller blocks until it observes REPLIED with Acquire, so the cell is alive.
         unsafe {
             (*(*self.cell).slot.get()).write(value);
-            // この Release store が呼び出し側を解放する境界。以降 cell に触れてはならない
-            // (呼び出し側が return して cell(スタック)を解放しうる = UAF になる)。
+            // This Release store is the boundary that releases the caller. The cell
+            // must not be touched afterwards (the caller may return and free the
+            // cell (on the stack) = a use-after-free).
             (*self.cell).state.store(REPLIED, Ordering::Release);
         }
-        // ゆえに Drop(ABANDONED 化 CAS)を走らせない。未返信で捨てられた場合のみ Drop が CAS する。
+        // Hence do not run Drop (the CAS to ABANDONED). Drop only performs the CAS
+        // when the token is dropped without replying.
         std::mem::forget(self);
     }
 }
 
 impl<R> Drop for Responder<R> {
     fn drop(&mut self) {
-        // reply されずに捨てられた場合のみ ABANDONED にして呼び出し側を Err で起こす。
-        // SAFETY: cell は呼び出し側がブロックして生かしている。
+        // Only when dropped without replying, set ABANDONED to wake the caller with an Err.
+        // SAFETY: the caller keeps the cell alive by blocking.
         unsafe {
             let _ = (*self.cell).state.compare_exchange(
                 PENDING,
@@ -78,50 +85,50 @@ impl<R> Drop for Responder<R> {
     }
 }
 
-/// `ask` の失敗理由。
+/// Reasons an `ask` can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskError {
-    /// actor が返信せずにメッセージ(Responder)を捨てた(送信後に停止・drop・panic 等)。
+    /// The actor dropped the message (Responder) without replying (stopped, dropped, panicked, etc. after send).
     NoReply,
-    /// 送信時点で受信 actor が既に消滅していた(送る先が無い)。
-    /// NoReply(送った後に返信されずに死んだ)とは区別される。
+    /// The receiving actor was already gone at send time (nowhere to send).
+    /// Distinct from NoReply (died after the message was sent without replying).
     Closed,
-    /// handler 内から**同一コア**の actor へ ask した = ブロックすればデッドロックする状況。
-    /// ハングせずこのエラーで返す。cross-actor の応答が要るなら別コアに置くか tell で設計する。
+    /// Asked an actor on the **same core** from within a handler = a situation that would deadlock if it blocked.
+    /// Returns this error instead of hanging. If a cross-actor response is needed, place it on a different core or design with tell.
     WouldBlockCallingCore,
 }
 
 impl<A: Actor> ActorRef<A> {
-    /// request-reply。`make_msg` に [`Responder`] を渡してメッセージを組み立て、送って返事を待つ。
-    /// **heap 確保ゼロ**(reply cell は呼び出しスタック上)。
+    /// Request-reply. Passes a [`Responder`] to `make_msg` to build the message, sends it, and waits for the reply.
+    /// **Zero heap allocation** (the reply cell lives on the caller's stack).
     ///
-    /// 例: `let r: u64 = addr.ask(|resp| MyMsg::Get(resp))?;`
+    /// Example: `let r: u64 = addr.ask(|resp| MyMsg::Get(resp))?;`
     ///
-    /// **注意**: 呼び出しスレッドをブロックする。handler 内から同一コアへ ask しないこと(deadlock)。
+    /// **Note**: blocks the calling thread. Do not ask the same core from within a handler (deadlock).
     pub fn ask<R>(&self, make_msg: impl FnOnce(Responder<R>) -> A::Message) -> Result<R, AskError>
     where
         R: Send + 'static,
     {
-        // デッドロックガード: 同一コアの handler 内から ask するとハングするので、
-        // ハングせずエラーで返す(send_blocking と違い ask は Result を返せる)。
+        // Deadlock guard: asking from within a handler on the same core would hang,
+        // so return an error instead of hanging (unlike send_blocking, ask can return a Result).
         if self.would_deadlock_calling_core() {
             return Err(AskError::WouldBlockCallingCore);
         }
         let cell = ReplyCell::<R>::new();
         let responder = Responder { cell: &cell };
         let msg = make_msg(responder);
-        // 送信時点で actor が消滅していれば Closed(NoReply は送信後に返信されない場合)。
-        // ここで抜けることで、ReplyCell(スタック上)への遅延書き込みも起こらない。
+        // If the actor is already gone at send time, Closed (NoReply is when there is no reply after sending).
+        // Bailing out here also prevents any deferred write into the ReplyCell (on the stack).
         if let Err(SendError::Closed(_)) = self.send_blocking(msg) {
             return Err(AskError::Closed);
         }
 
-        // 返事待ち(spin → yield → 短 sleep のバックオフ。ブロックだが CPU を焼き続けない)。
+        // Wait for the reply (spin → yield → short sleep backoff. Blocking, but does not keep burning CPU).
         let mut waited: u32 = 0;
         loop {
             match cell.state.load(Ordering::Acquire) {
                 REPLIED => {
-                    // SAFETY: REPLIED を観測 = actor の書き込み(Release)が可視。1 回だけ move out。
+                    // SAFETY: observing REPLIED = the actor's write (Release) is visible. Move out exactly once.
                     let value = unsafe { (*cell.slot.get()).assume_init_read() };
                     return Ok(value);
                 }
@@ -141,7 +148,7 @@ impl<A: Actor> ActorRef<A> {
     }
 }
 
-// loom ビルドでは実ランタイム(= loom 型)をモデル外で動かせないため対象外。
+// Excluded under loom builds, since the real runtime (= loom types) cannot run outside the model.
 #[cfg(all(test, not(aetherflow_loom)))]
 mod tests {
     use super::*;
@@ -150,7 +157,7 @@ mod tests {
     #[test]
     fn ask_returns_reply() {
         struct Doubler;
-        // メッセージ = (入力, 返信トークン)
+        // Message = (input, reply token)
         struct Req(u64, Responder<u64>);
         impl Actor for Doubler {
             type Message = Req;
@@ -179,7 +186,7 @@ mod tests {
             }
         }
         let sys = System::with_cores(3);
-        let addr = sys.spawn_on(2, Echo); // 別コア
+        let addr = sys.spawn_on(2, Echo); // a different core
         assert_eq!(addr.ask(|resp| resp).unwrap(), "pong");
         drop(addr);
         sys.shutdown();
@@ -191,7 +198,7 @@ mod tests {
         impl Actor for Rude {
             type Message = Responder<u64>;
             fn handle(&mut self, _resp: Responder<u64>) {
-                // 返信せずに drop → 呼び出し側は NoReply で起きる
+                // Drop without replying → the caller wakes up with NoReply
             }
         }
         let sys = System::with_cores(1);

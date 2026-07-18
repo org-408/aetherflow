@@ -1,18 +1,19 @@
-//! tokio 相互運用 — AetherFlow を tokio アプリの中に**埋める**(段階導入)。
+//! Tokio interop — **embed** AetherFlow inside a Tokio app (gradual adoption).
 //!
 //!   cargo run --example tokio_interop
 //!
-//! 使いどころ: 既存の async I/O(HTTP サーバ・DB クライアント等)は tokio のまま、**状態と計算だけ**
-//! AetherFlow の actor に載せる。フル書き換え無しで、ホットな状態管理をロックフリー・単一所有に移せる。
+//! Use case: keep your existing async I/O (HTTP server, DB client, ...) on Tokio, and move just the
+//! **state and compute** onto AetherFlow actors. No full rewrite — move hot state management onto a
+//! lock-free, single-owned actor.
 //!
-//! 相互運用の規則(2つだけ):
-//!  - **async → actor の送信は非ブロッキング**(`try_send` / `send_blocking`)。そのまま async から呼べる。
-//!  - **`ask`(返事待ち)は呼び出しスレッドをブロック**するので、async ランタイムを止めないよう
-//!    `tokio::task::spawn_blocking` の中で呼ぶ。
+//! Two interop rules:
+//!  - **async → actor sends are non-blocking** (`try_send` / `send_blocking`) — call them from async.
+//!  - **`ask` (awaiting a reply) blocks the calling thread**, so call it inside
+//!    `tokio::task::spawn_blocking` to avoid stalling the async runtime.
 
 use aetherflow::{Actor, Responder, System};
 
-/// tokio 側の多数の非同期ハンドラから叩かれる、共有の集計状態(でもロックは無い)。
+/// Shared aggregation state hit by many async handlers on the Tokio side — but with no lock.
 struct Metrics {
     requests: u64,
     bytes: u64,
@@ -38,7 +39,8 @@ impl Actor for Metrics {
 
 #[tokio::main]
 async fn main() {
-    // AetherFlow runtime を tokio アプリの中で立てる(共有機なので backoff で CPU を焼かない設定でもよい)。
+    // Stand up an AetherFlow runtime inside the Tokio app (on a shared box you might prefer
+    // `with_cores_idle(n, IdleStrategy::backoff())` to avoid burning CPU).
     let sys = System::with_cores(1);
     let metrics = sys.spawn_on(
         0,
@@ -48,15 +50,15 @@ async fn main() {
         },
     );
 
-    // 100 個の「非同期リクエストハンドラ」を模擬。各タスクは async I/O をした体で、
-    // 結果を AetherFlow の actor に**非ブロッキングで**送る。
+    // Simulate 100 async request handlers. Each does some async I/O, then reports its result to the
+    // AetherFlow actor with a non-blocking send.
     let mut handles = Vec::new();
     for i in 0..100u64 {
         let m = metrics.clone();
         handles.push(tokio::spawn(async move {
-            // ここで本来は await でネットワーク I/O をする(tokio の領分)。
+            // Real network I/O would await here (Tokio's job).
             tokio::task::yield_now().await;
-            // 状態更新は actor に委譲(ロック不要・単一所有)。送信は非ブロッキング。
+            // Delegate the state update to the actor (no lock, single-owned). Send is non-blocking.
             let _ = m.try_send(Cmd::Record { bytes: 100 + i });
         }));
     }
@@ -64,7 +66,7 @@ async fn main() {
         h.await.unwrap();
     }
 
-    // 集計を読む = ask(返事待ち)。ブロックするので spawn_blocking の中で呼ぶ。
+    // Read the aggregate = ask (awaits a reply). It blocks, so run it on a blocking thread.
     let m = metrics.clone();
     let (requests, bytes) = tokio::task::spawn_blocking(move || m.ask(Cmd::Snapshot).unwrap())
         .await
@@ -75,9 +77,9 @@ async fn main() {
     assert_eq!(bytes, (0..100u64).map(|i| 100 + i).sum());
 
     drop(metrics);
-    // shutdown もブロックするので blocking スレッドで(async を止めない)。
+    // shutdown also blocks, so run it on a blocking thread (don't stall async).
     tokio::task::spawn_blocking(move || sys.shutdown())
         .await
         .unwrap();
-    println!("ok — AetherFlow ran as the state core inside a tokio app");
+    println!("ok — AetherFlow ran as the state core inside a Tokio app");
 }

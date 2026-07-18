@@ -1,20 +1,21 @@
-//! 耐障害 — actor が panic しても、その actor だけ切り離して**新品に入れ替えて続行**する。
+//! Fault tolerance — when an actor panics, isolate just that actor and **replace it with a fresh
+//! one**, then keep going.
 //!
 //!   cargo run --example supervision
 //!
-//! ポイント: actor 状態は単一所有(共有なし)と**型が保証**するので、panic した actor を安全に
-//! 捨てて作り直せる(壊れた状態が誰にも共有されず残らない)。`Arc<Mutex>` 系は panic で Mutex が
-//! poison して続行不能になるのと対照的 ── 「隔離が耐障害性を解禁する」。
+//! Key idea: the type system guarantees actor state is single-owned (never shared), so a panicked
+//! actor can be safely dropped and rebuilt (no corrupted state lingers, shared by anyone). Contrast
+//! `Arc<Mutex>`, which poisons on panic and becomes unusable — "isolation unlocks fault tolerance".
 //!
-//! 注: panic 時に Rust 既定のパニックメッセージが stderr に出るのは正常(切り離しは起きている)。
+//! Note: Rust's default panic message on stderr is expected (the isolation still happens).
 
 use aetherflow::{Actor, System};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// 生成回数をプロセス全体で数える(restart で作り直された回数が見える)。
+/// Count builds process-wide, so we can see how many times a fresh actor was created (restarts).
 static BUILDS: AtomicU32 = AtomicU32::new(0);
 
-/// ジョブを処理する worker。`0` を渡されると panic する(= バグのある入力の模擬)。
+/// A worker that processes jobs. Given `0` it panics (simulating a buggy input).
 struct Worker {
     generation: u32,
     processed: u32,
@@ -49,7 +50,7 @@ impl Actor for Worker {
 fn main() {
     let sys = System::with_cores(1);
 
-    // supervised = パニックしたら make(=Worker::new)で作り直す。mailbox は保たれる。
+    // supervised = rebuild via make (Worker::new) on panic; the mailbox is preserved.
     let worker = sys.spawn_on_supervised(0, Worker::new);
 
     println!("sending: 1, 2, 0(poison), 3, 4");
@@ -60,7 +61,7 @@ fn main() {
     drop(worker);
     sys.shutdown();
 
-    // gen0 が 1,2 を処理 → 0 で panic → gen1 に入れ替わり 3,4 を処理。system は生きたまま。
+    // gen0 handles 1,2 → panics on 0 → gen1 replaces it and handles 3,4. The system stays alive.
     let builds = BUILDS.load(Ordering::SeqCst);
     println!("total worker generations built = {builds} (1 initial + restarts)");
     assert!(builds >= 2, "should have restarted at least once");

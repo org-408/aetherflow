@@ -1,10 +1,10 @@
-//! I/O as messages のデモ — echo サーバ(feature `net`)。
+//! I/O as messages demo — an echo server (feature `net`).
 //!
-//! 実行: `cargo run --example echo_server --features net -- 127.0.0.1:8079`
+//! Run: `cargo run --example echo_server --features net -- 127.0.0.1:8079`
 //!
-//! ユーザーが書くのはこれだけ ── socket を read/write せず、届いたバイトを `on_data` で受け、
-//! 送信は `io.write`(非ブロッキング)。await 無し・関数の色無し・`Pin` 無し。
-//! 参照バックエンド(移植性優先)で動く。busy-poll 性能版は Linux で後追い。
+//! This is all you write — you never read/write the socket. Bytes that arrive are delivered to
+//! `on_data`, and you send with `io.write` (non-blocking). No `async`, no function coloring, no
+//! `Pin`. Runs on the portable reference backend; the busy-poll performance path is Linux-only.
 
 use aetherflow::net::{serve, Connection, Io};
 use std::time::Duration;
@@ -16,7 +16,7 @@ impl Connection for Echo {
         io.write(b"welcome to aetherflow echo\n");
     }
     fn on_data(&mut self, buf: &[u8], io: &mut Io) {
-        io.write(buf); // 受け取った分をそのまま返す。それで終わり(run-to-completion)。
+        io.write(buf); // echo the bytes straight back — done (run-to-completion).
     }
 }
 
@@ -26,7 +26,7 @@ fn main() {
         .unwrap_or_else(|| "127.0.0.1:8079".to_string());
     let server = serve(&addr, || Echo).expect("bind failed");
     println!("listening on {}", server.local_addr());
-    // 動かし続ける(Ctrl-C で終了)。
+    // Keep running (Ctrl-C to stop).
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }

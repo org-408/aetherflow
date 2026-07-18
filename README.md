@@ -15,6 +15,8 @@
   [![license](https://img.shields.io/crates/l/aetherflow.svg)](#license)
 
   [Docs](docs/design.md) · [Why AetherFlow?](docs/direction-and-roadmap.md) · [Benchmarks](docs/stage0-bench-notes.md)
+
+  🌐 English · [日本語](README.ja.md)
 </div>
 
 ---

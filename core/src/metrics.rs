@@ -1,16 +1,19 @@
-//! opt-in の processing-latency ヒストグラム。
+//! Opt-in processing-latency histogram.
 //!
-//! handle 1 回の所要時間を log2(ns) バケットに記録する。**単一消費者(所有コアスレッド)だけが
-//! 書く**ので、`fetch_add(Relaxed)` でも競合ゼロ。読み手(任意スレッド)は relaxed load。
+//! Records the time taken by a single `handle` call into log2(ns) buckets.
+//! **Only a single consumer (the owning core's thread) writes**, so even
+//! `fetch_add(Relaxed)` has zero contention. Readers (any thread) use a relaxed
+//! load.
 //!
-//! `Instant::now()` のホットコスト(~数十 ns)があるため **既定 OFF**。`SpawnBuilder::instrumented()`
-//! で明示的に有効化したときだけ計測する(zero-overhead by default)。
+//! `Instant::now()` has a hot cost (~tens of ns), so it is **OFF by default**.
+//! Measurement happens only when explicitly enabled via
+//! `SpawnBuilder::instrumented()` (zero-overhead by default).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const BUCKETS: usize = 64;
 
-/// log2(ns) バケットの遅延ヒストグラム。
+/// Latency histogram with log2(ns) buckets.
 pub struct LatencyHistogram {
     buckets: [AtomicU64; BUCKETS],
     count: AtomicU64,
@@ -28,7 +31,7 @@ impl LatencyHistogram {
         }
     }
 
-    /// 1 サンプルを記録(所有コアスレッドのみが呼ぶ = 単一ライター)。
+    /// Record one sample (called only by the owning core's thread = single writer).
     pub(crate) fn record(&self, ns: u64) {
         let idx = if ns == 0 {
             0
@@ -38,13 +41,13 @@ impl LatencyHistogram {
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
-        // 単一ライターなので load→max→store で十分。
+        // Single writer, so load→max→store is sufficient.
         if ns > self.max_ns.load(Ordering::Relaxed) {
             self.max_ns.store(ns, Ordering::Relaxed);
         }
     }
 
-    /// 現在のスナップショット(分位はバケット粒度の近似)。
+    /// Current snapshot (percentiles are approximated at bucket granularity).
     pub fn snapshot(&self) -> LatencySnapshot {
         let count = self.count.load(Ordering::Relaxed);
         let counts: [u64; BUCKETS] =
@@ -58,7 +61,7 @@ impl LatencyHistogram {
             for (i, &c) in counts.iter().enumerate() {
                 acc += c;
                 if acc >= target {
-                    // バケット i = [2^i, 2^(i+1)) ns。中点近似。
+                    // Bucket i = [2^i, 2^(i+1)) ns. Midpoint approximation.
                     return (1u64 << i).saturating_add(1u64 << i.saturating_sub(1));
                 }
             }
@@ -79,7 +82,7 @@ impl LatencyHistogram {
     }
 }
 
-/// [`LatencyHistogram::snapshot`] の結果(単位は ns、分位はバケット粒度の近似)。
+/// Result of [`LatencyHistogram::snapshot`] (values in ns, percentiles approximated at bucket granularity).
 #[derive(Debug, Clone, Copy)]
 pub struct LatencySnapshot {
     pub count: u64,
