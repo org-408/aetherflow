@@ -75,6 +75,17 @@ let worker = sys.spawn_on_supervised(0, Worker::new);   // panic したら Worke
 状態は単一所有(共有なし)と**型が保証**するので、壊れた状態が誰にも残らず安全に restart できる
 (`Arc<Mutex>` は panic で poison して続行不能になるのと対照的)。
 
+## 4.5 一対多に配る — `pubsub`(ブロードキャスト)
+
+`ActorRef` は **Clone + Send** なので**メッセージに載せて渡せる** ── これで購読を登録する。
+Hub が購読者リストを単一所有で持ち、`Publish` を全員に `try_send`(非ブロッキング)で配る。
+
+```rust
+enum HubMsg { Subscribe(ActorRef<Subscriber>), Publish(String) }
+// handler 内(= 他 actor への送信)は try_send を使う(send_blocking は同一コアで deadlock):
+for sub in &self.subscribers { let _ = sub.try_send(text.clone()); }
+```
+
 ## 5. tokio に埋める — `tokio_interop`(段階導入)
 
 既存の async I/O は tokio のまま、**状態と計算だけ** AetherFlow に載せる。規則は2つ:
