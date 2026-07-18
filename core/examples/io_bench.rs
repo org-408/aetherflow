@@ -73,10 +73,15 @@ fn main() {
 fn run_client(addr: &str, iters: usize, conns: usize) {
     let per = iters / conns.max(1);
     let t0 = Instant::now();
+    // 高並行(数千接続)では接続ごとに1スレッド張るので、既定 8MB スタックだと OOM する。
+    // 小さめ(512KB)にして数千スレッドでもメモリに収める。
     let handles: Vec<_> = (0..conns)
         .map(|_| {
             let addr = addr.to_string();
-            std::thread::spawn(move || conn_worker(&addr, per))
+            std::thread::Builder::new()
+                .stack_size(512 * 1024)
+                .spawn(move || conn_worker(&addr, per))
+                .expect("spawn worker")
         })
         .collect();
     let mut lat: Vec<u64> = Vec::with_capacity(per * conns);
