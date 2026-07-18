@@ -72,7 +72,6 @@ pub use system::{ActorRef, IdleStrategy, RestartPolicy, SchedulingPolicy, SpawnB
 
 /// 非ブロッキング送信 `try_send` の失敗理由。いずれも**元のメッセージを返す**ので、
 /// 呼び出し側は再ルーティング・永続化・ログ記録ができる。
-#[derive(Debug)]
 pub enum TrySendError<T> {
     /// mailbox が満杯。**一時的なバックプレッシャ**(あとで空けば送れる)。
     Full(T),
@@ -80,12 +79,61 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
+impl<T> TrySendError<T> {
+    /// 失敗して返ってきた元のメッセージを取り出す(再送・永続化・ログに使う)。
+    pub fn into_message(self) -> T {
+        match self {
+            TrySendError::Full(m) | TrySendError::Closed(m) => m,
+        }
+    }
+}
+
 /// ブロッキング送信 `send_blocking` の失敗理由。満杯は待つので、残るのは Closed のみ。
-#[derive(Debug)]
 pub enum SendError<T> {
     /// 受信 actor が消滅済み(恒久的に送信不能)。元のメッセージを返す。
     Closed(T),
 }
+
+impl<T> SendError<T> {
+    /// 失敗して返ってきた元のメッセージを取り出す。
+    pub fn into_message(self) -> T {
+        match self {
+            SendError::Closed(m) => m,
+        }
+    }
+}
+
+// Debug/Display はメッセージ本体に依存しない(= `T: Debug` を要求しない)。
+// これにより Responder を運ぶメッセージでも `send*(..).unwrap()` がそのまま書ける。
+impl<T> std::fmt::Debug for TrySendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySendError::Full(_) => f.write_str("TrySendError::Full(mailbox full)"),
+            TrySendError::Closed(_) => f.write_str("TrySendError::Closed(actor gone)"),
+        }
+    }
+}
+impl<T> std::fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySendError::Full(_) => f.write_str("mailbox full (backpressure)"),
+            TrySendError::Closed(_) => f.write_str("actor is gone (permanently closed)"),
+        }
+    }
+}
+impl<T> std::error::Error for TrySendError<T> {}
+
+impl<T> std::fmt::Debug for SendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SendError::Closed(actor gone)")
+    }
+}
+impl<T> std::fmt::Display for SendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("actor is gone (permanently closed)")
+    }
+}
+impl<T> std::error::Error for SendError<T> {}
 
 /// 型付き actor。メッセージ型は固定で `Send`(= sendable な `iso`/`val` を型で要求)。
 pub trait Actor: Send + 'static {
