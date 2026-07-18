@@ -155,23 +155,24 @@ impl<F: FramedConnection> Connection for Framed<F> {
 
 // ───────────────────────── 参照 reactor(移植性優先。busy-poll 性能版ではない) ─────────────────────
 
-/// 起動中のサーバへのハンドル。`local_addr()` で実際の待受アドレス、`shutdown()` で停止。
+/// 起動中のサーバへのハンドル。`local_addr()` で待受アドレス、`shutdown()` で全 reactor を停止。
+/// thread-per-core([`serve_on_cores`])では reactor スレッドを複数保持する。
 pub struct ServerHandle {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    joins: Vec<JoinHandle<()>>,
 }
 
 impl ServerHandle {
-    /// 実際に bind されたアドレス(`:0` を渡した場合の割当ポート確認に使う)。
+    /// 待受アドレス(`serve*` に渡したもの / `:0` の場合は割当済みポート)。
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// reactor を止めて join する。
+    /// 全 reactor を止めて join する。
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
+        for j in self.joins.drain(..) {
             let _ = j.join();
         }
     }
@@ -180,7 +181,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
+        for j in self.joins.drain(..) {
             let _ = j.join();
         }
     }
@@ -282,8 +283,71 @@ where
     Ok(ServerHandle {
         addr: local,
         stop,
-        join: Some(join),
+        joins: vec![join],
     })
+}
+
+/// **thread-per-core serve**: `cores` の各コアに 1 本の reactor スレッドを立て、それぞれが
+/// **SO_REUSEPORT** で同じ `addr` に bind した専用 listener を持つ。カーネルが着信接続を各 listener に
+/// 分散するので、接続が N コアに散り、各コアが自分の接続だけを回す(= AetherFlow の thread-per-core
+/// 思想を I/O へ。glommio の N executor と N 対 N でスケール比較できる)。
+///
+/// `factory` は接続ごとに 1 インスタンス作るので **`Clone`** が要る(各 reactor が自分用に持つ)。
+/// `opts.pin_core` は無視され、各 reactor は `cores[i]` にピン留めされる。
+///
+/// **注意**: SO_REUSEPORT で複数 listener を同居させるため `addr` は**具体ポート必須**(`:0` は各
+/// listener が別ポートになり分散にならない)。Unix 専用(SO_REUSEPORT)。
+pub fn serve_on_cores<A, F, C>(
+    addr: A,
+    cores: &[usize],
+    factory: F,
+    opts: ServeOptions,
+) -> io::Result<ServerHandle>
+where
+    A: ToSocketAddrs,
+    F: Fn() -> C + Send + Clone + 'static,
+    C: Connection,
+{
+    assert!(!cores.is_empty(), "serve_on_cores needs at least 1 core");
+    let addr: SocketAddr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "no addr"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut joins = Vec::with_capacity(cores.len());
+
+    for &core in cores {
+        let listener = reuseport_listener(addr)?;
+        let stop_t = Arc::clone(&stop);
+        let factory_t = factory.clone();
+        let mut opts_t = opts;
+        opts_t.pin_core = Some(core);
+        let join = thread::Builder::new()
+            .name(format!("aether-net-{core}"))
+            .spawn(move || reactor_loop(listener, factory_t, stop_t, opts_t))?;
+        joins.push(join);
+    }
+
+    Ok(ServerHandle { addr, stop, joins })
+}
+
+/// SO_REUSEPORT + SO_REUSEADDR を立てた nonblocking listener を addr に bind する
+/// (複数コアが同じ addr で並行 accept できる)。
+fn reuseport_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(sock.into())
 }
 
 fn reactor_loop<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
@@ -610,6 +674,32 @@ mod tests {
         assert_eq!(&got, b"FOO\nBAR\n");
         assert_eq!(&*FRAMES.lock().unwrap(), &["foo".to_string(), "bar".to_string()]);
         drop(c);
+        server.shutdown();
+    }
+
+    #[test]
+    fn multicore_reuseport_echo() {
+        // 2 コア(2 reactor + SO_REUSEPORT)で echo。複数クライアントが分散着信しても全員 echo が返る。
+        #[derive(Clone)]
+        struct Echo;
+        impl Connection for Echo {
+            fn on_data(&mut self, buf: &[u8], io: &mut Io) {
+                io.write(buf);
+            }
+        }
+        // 具体ポート必須(:0 は reuseport で別ポートになる)。衝突回避のため高めの固定ポート。
+        let addr = "127.0.0.1:19911";
+        let server = serve_on_cores(addr, &[0, 1], || Echo, ServeOptions::default()).unwrap();
+        // 8 本つないでそれぞれ echo 確認(カーネルが 2 listener に分散する)。
+        let mut clients: Vec<TcpStream> = (0..8).map(|_| connect(server.local_addr())).collect();
+        for (i, c) in clients.iter_mut().enumerate() {
+            let msg = format!("hello-{i}");
+            c.write_all(msg.as_bytes()).unwrap();
+            let mut buf = vec![0u8; msg.len()];
+            c.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, msg.as_bytes());
+        }
+        drop(clients);
         server.shutdown();
     }
 
