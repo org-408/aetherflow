@@ -227,23 +227,16 @@ impl<C: Connection> Conn<C> {
 }
 
 /// reactor の回し方。同じ nonblocking コードを、開発機では控えめに、専有コアでは busy-poll で回す。
-#[derive(Clone, Copy)]
+///
+/// 既定(`Default`)は移植性・開発優先 = `busy_poll: false`(各周回で短く sleep)・`pin_core: None`。
+/// busy-poll + ピン留めは明示 opt-in(専有コアの低レイテンシ経路)。
+#[derive(Clone, Copy, Default)]
 pub struct ServeOptions {
     /// `true`: sleep せず回し続ける = **busy-poll**(低レイテンシ・専有コア前提。Linux 実測の性能経路)。
-    /// `false`: 各周回で短く sleep = 参照/開発用(共有機で CPU を焼かない)。
+    /// `false`(既定): 各周回で短く sleep = 参照/開発用(共有機で CPU を焼かない)。
     pub busy_poll: bool,
     /// `Some(core)`: reactor スレッドをそのコアへ best-effort ピン留め(busy-poll と対で効く)。
     pub pin_core: Option<usize>,
-}
-
-impl Default for ServeOptions {
-    fn default() -> Self {
-        // 既定は移植性・開発優先(sleep あり・ピン無し)。busy-poll は明示 opt-in。
-        Self {
-            busy_poll: false,
-            pin_core: None,
-        }
-    }
 }
 
 /// サーバを起動する(既定オプション = 参照/開発用)。`addr` に bind し、接続ごとに `factory()` で

@@ -45,47 +45,62 @@ fn main() {
         "client" => {
             let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:9001".into());
             let iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000);
-            run_client(&addr, iters);
+            let conns: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+            run_client(&addr, iters, conns);
         }
         _ => {
-            eprintln!("modes: aether-server <addr> <core> | client <addr> <iters>");
+            eprintln!("modes: aether-server <addr> <core> | client <addr> <iters> [conns]");
         }
     }
 }
 
-fn run_client(addr: &str, iters: usize) {
+/// `conns` 本の接続を並行に張り、合計 `iters` 往復を等分して回す。各接続は自スレッドで
+/// 逐次 request-response。全接続の RTT を集約して分位を出し、throughput は全体の実測。
+fn run_client(addr: &str, iters: usize, conns: usize) {
+    let per = iters / conns.max(1);
+    let t0 = Instant::now();
+    let handles: Vec<_> = (0..conns)
+        .map(|_| {
+            let addr = addr.to_string();
+            std::thread::spawn(move || conn_worker(&addr, per))
+        })
+        .collect();
+    let mut lat: Vec<u64> = Vec::with_capacity(per * conns);
+    for h in handles {
+        lat.extend(h.join().expect("worker"));
+    }
+    let elapsed = t0.elapsed();
+
+    lat.sort_unstable();
+    let pct = |p: f64| lat[((lat.len() as f64 * p) as usize).min(lat.len() - 1)];
+    let thru = lat.len() as f64 / elapsed.as_secs_f64();
+    println!(
+        "conns={:>4}  RTT ns p50={:>7} p90={:>7} p99={:>8} p999={:>8}  throughput(req-resp/s)={:>10.0}",
+        conns,
+        pct(0.50),
+        pct(0.90),
+        pct(0.99),
+        pct(0.999),
+        thru
+    );
+}
+
+fn conn_worker(addr: &str, iters: usize) -> Vec<u64> {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_nodelay(true).unwrap(); // Nagle 無効 = RTT を正しく測る
     let payload = [0xABu8; 32];
     let mut buf = [0u8; 32];
-
     // warmup
-    for _ in 0..iters.min(20_000) {
+    for _ in 0..iters.min(5_000) {
         s.write_all(&payload).unwrap();
         s.read_exact(&mut buf).unwrap();
     }
-
-    // RTT 測定(1 往復ずつ = ping-pong)
     let mut lat = Vec::with_capacity(iters);
-    let t0 = Instant::now();
     for _ in 0..iters {
         let a = Instant::now();
         s.write_all(&payload).unwrap();
         s.read_exact(&mut buf).unwrap();
         lat.push(a.elapsed().as_nanos() as u64);
     }
-    let elapsed = t0.elapsed();
-
-    lat.sort_unstable();
-    let pct = |p: f64| lat[((lat.len() as f64 * p) as usize).min(lat.len() - 1)];
-    let thru = iters as f64 / elapsed.as_secs_f64();
-    println!(
-        "RTT ns  p50={:>7}  p90={:>7}  p99={:>7}  p999={:>7}  max={:>8}",
-        pct(0.50),
-        pct(0.90),
-        pct(0.99),
-        pct(0.999),
-        lat[lat.len() - 1]
-    );
-    println!("throughput (req-resp/s, single conn seq) = {:.0}", thru);
+    lat
 }
