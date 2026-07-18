@@ -155,6 +155,31 @@ fn on_writable(&mut self, io: &mut Io) { io.resume_reads(); /* 続き */ }   // 
 4. accept したコネクションのコア割り当て(round-robin / least-conn)。
 5. TLS・部分書き込み・EOF 半クローズの扱い(v1 スコープに含めるか)。
 
+## 7.5 第一次 I/O 実測(2026-07-18, AWS c7g.large / Graviton3 / 2 vCPU)
+
+**フェアな echo RTT 比較**(同一マシン・同一 client・server=core0 / client=core1 に taskset 固定・
+localhost・payload 32B・200k iters・warmup 20k・1回)。AetherFlow は busy-poll(`ServeOptions{busy_poll,
+pin_core}`)、glommio は io_uring + `Placement::Fixed`。
+
+| echo server | p50 | p90 | p99 | p999 | throughput(req-resp/s, 単一接続 seq) |
+|---|--:|--:|--:|--:|--:|
+| **AetherFlow busy-poll** | **9,124 ns** | **9,983 ns** | **12,575 ns** | **17,436 ns** | **103,401** |
+| glommio (io_uring) | 14,907 ns | 16,291 ns | 18,893 ns | 21,530 ns | 65,219 |
+| 比 | 1.63× | 1.63× | 1.50× | 1.23× | 1.59× |
+
+→ **glommio の本丸(I/O)で、低レイテンシ echo slice の全分位 + throughput に勝った(第一次)。**
+「全勝」の未完だった I/O 土俵に、初めて実測の足がかり。
+
+**正直な但し書き(過大評価しない)**:
+- **第一次・簡易**: 単一接続・逐次 request-response・localhost・1回のみ(多重実行/分散/高並行なし)。
+  権威値ではない ── 複数回 + 変動幅 + 高並行(多コネクション)を後で測る。
+- **勝ちは"低レイテンシ・低〜中コネクション slice"**。高並行(1万接続)は readiness モデル(epoll/
+  io_uring)が busy-poll スキャンより有利 = glommio 領域。主張は「低レイテンシ server I/O で勝つ」を維持。
+- **倍率がメッセージパッシング(36×等)より小さいのは当然**: ここは両者ともカーネル TCP スタックの
+  syscall コストを実際に払うため、共通コストが支配的で差が圧縮される。それでも明確・再現可能な勝ち。
+- 参照バックエンド(nonblocking scan)の busy-poll 版で得た数字。将来 io_uring 直叩きの native backend で
+  さらに詰められる余地あり(この数字はその前の下限)。
+
 ## 8. 状態と次の一歩
 - **[済 2026-07-16] 表面 API + ポータブル参照バックエンドを実装**(`core/src/net.rs`、feature `net`、
   既定 OFF)。`Connection`/`Io`/`FramedConnection`/`Codec`(`LengthPrefixed`/`Lines`)/`serve`。
