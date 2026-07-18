@@ -237,10 +237,13 @@ pub struct ServeOptions {
     pub busy_poll: bool,
     /// `Some(core)`: reactor スレッドをそのコアへ best-effort ピン留め(busy-poll と対で効く)。
     pub pin_core: Option<usize>,
-    /// `true` **かつ Linux**: 全 fd スキャンでなく **epoll(readiness)** で ready な fd だけ捌く。
-    /// 高並行で tail を締める(scan は O(接続数)で高並行時に一部接続が待たされ tail 暴発)。
-    /// `busy_poll` と併用すると epoll_wait を timeout=0 で回す(park しない低レイテンシ経路)。
-    /// 非 Linux では無視(scan にフォールバック)。
+    /// `true` **かつ Linux**: 全 fd スキャンでなく **epoll(readiness)** で ready な fd だけ捌く = O(ready)。
+    /// `busy_poll` と併用すると epoll_wait を timeout=0 で回す(park しない)。非 Linux では無視(scan)。
+    ///
+    /// **既定は `false`(scan)を推奨。** 実測(8 vCPU, AWS c7g)では、サーバコアが飽和しない範囲
+    /// (〜256接続)では **scan busy-poll の方が速い**(epoll_wait の syscall が純オーバーヘッドになる)。
+    /// epoll の O(ready) 優位は**超高 fd 数(数千接続)**で初めて効くはずだが、そこは未実証(要 harness 改善)。
+    /// 現状 epoll が明確に勝るのは「低接続の tail の平坦さ」のみ。`docs/io-surface-design.md` §7.5 参照。
     pub epoll: bool,
 }
 
