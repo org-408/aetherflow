@@ -28,16 +28,20 @@ fn main() {
         "aether-server" => {
             let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:9001".into());
             let core: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            // 第4引数 "epoll" で Linux epoll readiness backend、既定は scan busy-poll。
+            let epoll = args.get(4).map(|s| s == "epoll").unwrap_or(false);
             let server = serve_with(
                 &addr,
                 || Echo,
                 ServeOptions {
                     busy_poll: true,
                     pin_core: Some(core),
+                    epoll,
                 },
             )
             .expect("bind");
-            println!("aether busy-poll echo on {} (pinned core {core})", server.local_addr());
+            let mode = if epoll { "epoll" } else { "scan" };
+            println!("aether {mode} busy-poll echo on {} (pinned core {core})", server.local_addr());
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }

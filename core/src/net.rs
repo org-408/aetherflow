@@ -237,6 +237,11 @@ pub struct ServeOptions {
     pub busy_poll: bool,
     /// `Some(core)`: reactor スレッドをそのコアへ best-effort ピン留め(busy-poll と対で効く)。
     pub pin_core: Option<usize>,
+    /// `true` **かつ Linux**: 全 fd スキャンでなく **epoll(readiness)** で ready な fd だけ捌く。
+    /// 高並行で tail を締める(scan は O(接続数)で高並行時に一部接続が待たされ tail 暴発)。
+    /// `busy_poll` と併用すると epoll_wait を timeout=0 で回す(park しない低レイテンシ経路)。
+    /// 非 Linux では無視(scan にフォールバック)。
+    pub epoll: bool,
 }
 
 /// サーバを起動する(既定オプション = 参照/開発用)。`addr` に bind し、接続ごとに `factory()` で
@@ -279,6 +284,22 @@ where
 }
 
 fn reactor_loop<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
+where
+    F: Fn() -> C,
+    C: Connection,
+{
+    // Linux で epoll 指定なら readiness reactor へ。それ以外は移植性 scan reactor。
+    #[cfg(target_os = "linux")]
+    if opts.epoll {
+        epoll_reactor(listener, factory, stop, opts);
+        return;
+    }
+    scan_reactor(listener, factory, stop, opts);
+}
+
+/// 移植性 scan reactor: 全接続を nonblocking で舐める。低コネクション・低レイテンシに最適
+/// (epoll_wait の syscall が無い)。高並行では O(接続数)スキャンで tail が伸びる → Linux は epoll。
+fn scan_reactor<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
 where
     F: Fn() -> C,
     C: Connection,
@@ -354,6 +375,140 @@ where
             thread::sleep(Duration::from_micros(100));
         }
     }
+}
+
+/// Linux epoll(readiness)reactor: ready な fd だけを捌く = O(ready)。高並行でも一部接続が
+/// スキャン待ちで飢えないので tail が締まる(glommio の io_uring と同じ発想)。`busy_poll` 時は
+/// epoll_wait を timeout=0 で回す(park しない)。level-triggered(EPOLLET なし)= 部分読みでも
+/// 次周回で再発火するので単純。
+#[cfg(target_os = "linux")]
+fn epoll_reactor<F, C>(listener: TcpListener, factory: F, stop: Arc<AtomicBool>, opts: ServeOptions)
+where
+    F: Fn() -> C,
+    C: Connection,
+{
+    use std::collections::HashMap;
+    use std::os::unix::io::AsRawFd;
+
+    if let Some(core) = opts.pin_core {
+        crate::pinning::pin_current_thread_to(core);
+    }
+
+    let epfd = unsafe { libc::epoll_create1(0) };
+    assert!(epfd >= 0, "epoll_create1 failed");
+    let listen_fd = listener.as_raw_fd();
+
+    // fd を epoll に (EPOLLIN|EPOLLOUT で) 登録/変更する小ヘルパ。
+    let ctl = |op: libc::c_int, fd: libc::c_int, want_out: bool| {
+        let mut events = libc::EPOLLIN as u32;
+        if want_out {
+            events |= libc::EPOLLOUT as u32;
+        }
+        let mut ev = libc::epoll_event {
+            events,
+            u64: fd as u64,
+        };
+        unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) }
+    };
+    ctl(libc::EPOLL_CTL_ADD, listen_fd, false);
+
+    let mut conns: HashMap<libc::c_int, Conn<C>> = HashMap::new();
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
+    let mut rbuf = [0u8; 4096];
+    let timeout = if opts.busy_poll { 0 } else { 10 };
+
+    while !stop.load(Ordering::Acquire) {
+        let n = unsafe {
+            libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as libc::c_int, timeout)
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        for ev in events.iter().take(n as usize) {
+            let fd = ev.u64 as libc::c_int;
+
+            if fd == listen_fd {
+                // 受けられるだけ accept(level-triggered なので残ればまた発火)。
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if stream.set_nonblocking(true).is_err() {
+                                continue;
+                            }
+                            let cfd = stream.as_raw_fd();
+                            let mut conn = Conn {
+                                stream,
+                                handler: factory(),
+                                io: Io::default(),
+                            };
+                            conn.handler.on_open(&mut conn.io);
+                            let _ = conn.try_flush();
+                            if conn.closing_done() {
+                                conn.handler.on_close();
+                                continue;
+                            }
+                            ctl(libc::EPOLL_CTL_ADD, cfd, !conn.io.out.is_empty());
+                            conns.insert(cfd, conn);
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                continue;
+            }
+
+            let mut remove = false;
+            if let Some(conn) = conns.get_mut(&fd) {
+                let bits = ev.events;
+                if bits & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
+                    conn.handler.on_close();
+                    remove = true;
+                } else {
+                    if bits & (libc::EPOLLIN as u32) != 0 {
+                        match conn.stream.read(&mut rbuf) {
+                            Ok(0) => {
+                                conn.handler.on_close();
+                                remove = true;
+                            }
+                            Ok(cnt) => {
+                                let c = &mut *conn;
+                                c.handler.on_data(&rbuf[..cnt], &mut c.io);
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                            Err(_) => {
+                                conn.handler.on_close();
+                                remove = true;
+                            }
+                        }
+                    }
+                    if !remove {
+                        if conn.try_flush().is_err() || conn.closing_done() {
+                            conn.handler.on_close();
+                            remove = true;
+                        } else {
+                            // 送信残があれば EPOLLOUT を要求、無ければ EPOLLIN のみ。
+                            ctl(libc::EPOLL_CTL_MOD, fd, !conn.io.out.is_empty());
+                        }
+                    }
+                }
+            }
+            if remove {
+                unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+                conns.remove(&fd);
+            }
+        }
+
+        if opts.busy_poll && n == 0 {
+            std::hint::spin_loop();
+        }
+    }
+
+    unsafe { libc::close(epfd) };
 }
 
 #[cfg(test)]

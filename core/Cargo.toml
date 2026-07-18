@@ -14,12 +14,14 @@ description = "A high-performance, thread-per-core actor runtime for Rust. Messa
 
 [features]
 # I/O as messages 表面(DRAFT)。まだ既定 OFF ── 公開既定の API を変えずに反復するため。
-# 現状はポータブル参照バックエンド(std のみ)。busy-poll 性能版(Linux)を後で足す。
-net = []
+# ポータブル参照バックエンド(scan)+ Linux の epoll readiness backend(高並行 tail 用)。
+net = ["dep:libc"]
 
 [dependencies]
 # Best-effort core pinning: real sched_setaffinity on Linux, graceful no-op on macOS.
 core_affinity = "0.8"
+# net feature の Linux epoll backend 用(cfg(linux) の readiness reactor でのみ使用)。
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Stage 0 ベンチのベースライン比較用(work-stealing / 実 actor FW)。
