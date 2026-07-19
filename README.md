@@ -104,6 +104,7 @@ A 10-minute path from "hello actor" to a real pattern — see the
 | [`sharded`](core/examples/sharded.rs) | Fan-out across cores (thread-per-core, no locks) |
 | [`supervision`](core/examples/supervision.rs) | Panic isolation + automatic restart |
 | [`pubsub`](core/examples/pubsub.rs) | One-to-many broadcast — `ActorRef`s passed in messages |
+| [`timers`](core/examples/timers.rs) | Delayed + periodic messages (`send_after` / `send_every`) |
 | [`tokio_interop`](core/examples/tokio_interop.rs) | Embed AetherFlow as the state core inside a Tokio app |
 | [`echo_server`](core/examples/echo_server.rs) | I/O as messages — a TCP server, no `async` (`--features net`) |
 

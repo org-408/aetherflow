@@ -95,6 +95,22 @@ enum HubMsg { Subscribe(ActorRef<Subscriber>), Publish(String) }
 for sub in &self.subscribers { let _ = sub.try_send(text.clone()); }
 ```
 
+## 4.6 Scheduling — `timers` (`send_after` / `send_every`)
+
+Any `ActorRef` can schedule messages. `send_after` fires once after a delay; `send_every` fires on
+an interval and returns a `TimerHandle` you can `cancel`. Delivery is non-blocking (best-effort), and
+a periodic timer stops on its own once the actor is gone (so a dropped handle never leaks).
+
+```rust
+hb.send_after(Duration::from_millis(50), Msg::WarmupDone);        // one-shot, fire-and-forget
+let ticker = hb.send_every(Duration::from_millis(30), || Msg::Tick); // periodic
+// ...
+ticker.cancel();                                                  // stop the periodic timer
+```
+
+Timers run on one shared background thread — meant for "tick every N ms" / "fire after a delay", not
+sub-microsecond scheduling.
+
 ## 5. Embedding in Tokio — `tokio_interop` (gradual adoption)
 
 Keep your existing async I/O on Tokio and move just the **state and compute** onto AetherFlow. Two
