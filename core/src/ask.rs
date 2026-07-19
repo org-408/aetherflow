@@ -24,11 +24,9 @@
 //! core from within a handler would deadlock**, so that situation is rejected with
 //! [`AskError::WouldBlockCallingCore`].
 
+use crate::sync::{AtomicU8, Arc, Ordering, UnsafeCell};
 use crate::{Actor, ActorRef, SendError};
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PENDING: u8 = 0;
@@ -61,9 +59,10 @@ impl<R> Drop for ReplyCell<R> {
         // drops its Arc, the actor replies late and was the last Arc holder. There
         // is no longer a recipient, so drop the written value (no leak, no UAF).
         // The fast path (stack cell) transitions to CONSUMED on read, so it never gets here.
-        if *self.state.get_mut() == REPLIED {
+        // &mut self = exclusive, so a Relaxed load reads the final state (no ordering needed).
+        if self.state.load(Ordering::Relaxed) == REPLIED {
             // SAFETY: REPLIED = the slot is initialized. This cell owns it, and there is no other reader.
-            unsafe { (*self.slot.get()).assume_init_drop() };
+            self.slot.with_mut(|p| unsafe { (*p).assume_init_drop() });
         }
     }
 }
@@ -107,7 +106,7 @@ impl<R> Responder<R> {
 
         let cref = cell.get();
         // SAFETY: the caller does not touch the slot until it reads the state with Acquire. This is the only writer.
-        unsafe { (*cref.slot.get()).write(value) };
+        cref.slot.with_mut(|p| unsafe { (*p).write(value) });
         // This Release store is the boundary that releases the caller. For Borrowed,
         // touching the cell afterwards could race the caller returning and freeing the
         // stack (UAF), so we finish using cref here.
@@ -179,7 +178,7 @@ impl<A: Actor> ActorRef<A> {
             match cell.state.load(Ordering::Acquire) {
                 REPLIED => {
                     // SAFETY: observing REPLIED = the actor's write (Release) is visible. Move out exactly once.
-                    let value = unsafe { (*cell.slot.get()).assume_init_read() };
+                    let value = cell.slot.with_mut(|p| unsafe { (*p).assume_init_read() });
                     // Record that it was moved out, so the stack cell's Drop does not double-drop.
                     cell.state.store(CONSUMED, Ordering::Relaxed);
                     return Ok(value);
@@ -226,7 +225,7 @@ impl<A: Actor> ActorRef<A> {
             match cell.state.load(Ordering::Acquire) {
                 REPLIED => {
                     // SAFETY: observing REPLIED = the actor's write (Release) is visible. Move out exactly once.
-                    let value = unsafe { (*cell.slot.get()).assume_init_read() };
+                    let value = cell.slot.with_mut(|p| unsafe { (*p).assume_init_read() });
                     // Record that it was moved out, so the cell's (Arc) final Drop does not double-drop.
                     cell.state.store(CONSUMED, Ordering::Relaxed);
                     return Ok(value);
@@ -261,6 +260,62 @@ fn backoff(waited: &mut u32) {
         std::thread::sleep(Duration::from_micros(20));
     }
     *waited = waited.saturating_add(1);
+}
+
+// Loom model of the ReplyCell handshake. Loom can't run the real runtime, so we model the two
+// participants directly: an "actor" thread that drives a `Responder` (reply or drop), and a
+// "caller" thread that runs the same wait loop as `ask` (Acquire-load the state, read the slot on
+// REPLIED, error on ABANDONED). Loom exhaustively explores the interleavings and, via its
+// instrumented `UnsafeCell`, proves the slot is never accessed concurrently — i.e. the
+// Release/Acquire discipline actually establishes the happens-before the unsafe code relies on.
+// (UB / drop-exactly-once is Miri's job; ordering/visibility is Loom's.)
+#[cfg(all(test, aetherflow_loom))]
+mod loom_tests {
+    use super::*;
+
+    // The caller's wait loop, expressed with loom primitives (yield_now lets loom schedule the
+    // other thread). Mirrors the REPLIED/ABANDONED handling in `ActorRef::ask`.
+    fn caller_wait<R>(cell: &ReplyCell<R>) -> Option<R> {
+        loop {
+            match cell.state.load(Ordering::Acquire) {
+                REPLIED => {
+                    let v = cell.slot.with_mut(|p| unsafe { (*p).assume_init_read() });
+                    cell.state.store(CONSUMED, Ordering::Relaxed);
+                    break Some(v);
+                }
+                ABANDONED => break None,
+                _ => loom::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn reply_delivers_value_race_free() {
+        loom::model(|| {
+            let cell = Arc::new(ReplyCell::<u32>::new());
+            let responder = Responder {
+                cell: Cell::Owned(Arc::clone(&cell)),
+            };
+            let actor = loom::thread::spawn(move || responder.reply(42));
+            let got = caller_wait(&cell);
+            actor.join().unwrap();
+            assert_eq!(got, Some(42));
+        });
+    }
+
+    #[test]
+    fn drop_without_reply_wakes_caller() {
+        loom::model(|| {
+            let cell = Arc::new(ReplyCell::<u32>::new());
+            let responder = Responder {
+                cell: Cell::Owned(Arc::clone(&cell)),
+            };
+            let actor = loom::thread::spawn(move || drop(responder)); // no reply → ABANDONED
+            let got = caller_wait(&cell);
+            actor.join().unwrap();
+            assert_eq!(got, None);
+        });
+    }
 }
 
 // Excluded under loom builds, since the real runtime (= loom types) cannot run outside the model.

@@ -21,12 +21,12 @@
 #[cfg(aetherflow_loom)]
 pub(crate) use loom::cell::UnsafeCell;
 #[cfg(aetherflow_loom)]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(aetherflow_loom)]
 pub(crate) use loom::sync::Arc;
 
 #[cfg(not(aetherflow_loom))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(not(aetherflow_loom))]
 pub(crate) use std::sync::Arc;
 
