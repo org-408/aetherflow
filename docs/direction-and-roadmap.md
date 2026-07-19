@@ -1,223 +1,223 @@
-# AetherFlow 方向性とロードマップ
+# AetherFlow Direction and Roadmap
 
-> この文書の位置づけ: `design.md` が「何を作るか(技術的 Thesis)」を述べるのに対し、本書は
-> **「なぜその作り方に決めたか」** という意思決定と技術的な道筋を残す。
-> 2026-07-02 の設計議論の結論。将来の自分が「また同じ所で悶える」のを防ぐための地図。
+> 🌐 English | [日本語](direction-and-roadmap.ja.md)
+
+
+> Where this document sits: whereas `design.md` states **what we are building** (the technical thesis),
+> this document records the decisions and technical reasoning behind **why we settled on building it this way**.
+> It is the conclusion of the 2026-07-02 design discussion — a map to keep a future version of me from
+> "agonizing over the same fork all over again."
 >
-> ※ 本書は技術ロードマップに徹する(事業・ドメイン方面の検討は本書の範囲外)。
+> Note: this document stays strictly a technical roadmap (business and domain considerations are out of scope here).
 
 ---
 
-## 1. 頓挫の総括 — なぜ一度止まったか
+## 1. Post-mortem of the stall — why it once ground to a halt
 
-コードが汚いことが原因ではない。真因は **「未決の分岐を放置したまま両方の都合を混ぜたこと」**。
+The cause was not dirty code. The real cause was **leaving an unresolved fork open and mixing in the conveniences of both sides at once**.
 
-当時は Tokio(async ランタイム)を研究し、Akka(actor 実行モデル)を研究し、**どちらに乗るかを決めきらないまま**実装した。結果、`core/src` には:
+Back then I studied Tokio (an async runtime), studied Akka (an actor execution model), and implemented **without ever committing to which one to build on**. As a result, `core/src` ended up with:
 
-- `Arc<Mutex<T>>`(Akka 的な共有 + 実行時ロック)
-- `async fn receive`(Tokio 的な非同期)
-- `Mailbox` / `Dispatcher` / `Runtime` トレイト(自前ランタイム的な抽象)
+- `Arc<Mutex<T>>` (Akka-style sharing + runtime locking)
+- `async fn receive` (Tokio-style asynchrony)
+- `Mailbox` / `Dispatcher` / `Runtime` traits (a homegrown-runtime-style abstraction)
 
-が**同居し、どれも中途半端**になった。スキルの問題ではなく、**意思決定の欠落**が頓挫の正体。
+**all coexisting, none of them finished**. It was not a skills problem; the real identity of the stall was the **absence of a decision**.
 
-→ 教訓: **技術に手を付ける前に分岐を潰す。** 方向が一意なら、コードは一方向にしか流れず、悶える余地が消える。
+→ Lesson: **kill the fork before touching the technology.** When the direction is singular, code can only flow one way, and the room to agonize disappears.
 
 ---
 
-## 2. 現状の実装の実態(2026-07 時点)
+## 2. The actual state of the implementation (as of 2026-07)
 
-> ※ 以下は再構築前(旧 `Arc<Mutex>` 実装)のスナップショット。§6 の着手ログのとおり、現在は
-> typed / move / SPSC・MPSC / コアピン留めの新ランタイム(`core/`, package `aetherflow`)に置換済み。
-> ここは「なぜ作り直したか」の記録として残す。
+> Note: the following is a snapshot from before the rebuild (the old `Arc<Mutex>` implementation). As the work log in §6 shows, it has since been
+> replaced by the new runtime with typed / move / SPSC & MPSC / core-pinning (`core/`, package `aetherflow`).
+> This section is kept as a record of "why we rebuilt."
 
-`core/src` は **トレイト定義のスケルトンが大半で、動く実体は「メッセージを受けてログ出力するだけ」**。
-データが流れる唯一の経路は `main.rs` → `ActorRef::tell` → `receiver.receive()` で、そこで `println!` / `info!` するだけ。
+`core/src` was **mostly a skeleton of trait definitions, and the only working substance was "receive a message and log it."**
+The one path through which data actually flowed was `main.rs` → `ActorRef::tell` → `receiver.receive()`, where it merely did `println!` / `info!`.
 
-### 動く部分
-- `reference.rs` の `ActorRef<T> = { actor: Arc<Mutex<T>>, sender: Arc<Mutex<dyn ActorSender>>, receiver: Arc<Mutex<dyn ActorReceiver>> }`。`tell` は `receiver.lock().await` して `receive(msg)` を呼ぶだけ。
-- `message.rs`: `Arc<dyn Message>`(全 `T: Any+Send+Sync+Debug` へのブランケット実装)。
-- `lifecycle.rs`: 状態遷移マシンは実装済みだが **どこからも呼ばれていない**。
-- `path.rs`: `ActorPath` ビルダーのみ。
+### The working parts
+- `reference.rs`'s `ActorRef<T> = { actor: Arc<Mutex<T>>, sender: Arc<Mutex<dyn ActorSender>>, receiver: Arc<Mutex<dyn ActorReceiver>> }`. `tell` merely does `receiver.lock().await` and calls `receive(msg)`.
+- `message.rs`: `Arc<dyn Message>` (a blanket impl for every `T: Any+Send+Sync+Debug`).
+- `lifecycle.rs`: the state-transition machine is implemented but **is never called from anywhere**.
+- `path.rs`: only the `ActorPath` builder.
 
-### トレイトだけで中身が空(未接続)
-- `mailbox.rs`: `Mailbox` トレイトはあるが `UnboundedMailbox` / `BoundedMailbox` 実装は **全部コメントアウト**。
-- `dispatcher.rs` / `runtime.rs` / `executor.rs`: メソッド 1〜2 個のトレイトのみ、実装ゼロ。
-- `behavior.rs` / `action.rs` / `state.rs` / `task.rs` / `encapsulator.rs`(`Envelope`)/ `decapsulator.rs`: 型はあるが送受信経路と **繋がっていない**。
-- `derive/src/lib.rs`: `#[derive(Actor)]` がコメントアウト済みの `UnboundedMailbox::new(10)` を前提にするため **今使うとコンパイル不能**。
-- `remote` / `cluster` / `persistence` / `streams`: crate 枠だけ。
+### Traits with empty bodies (unwired)
+- `mailbox.rs`: the `Mailbox` trait exists, but the `UnboundedMailbox` / `BoundedMailbox` implementations are **all commented out**.
+- `dispatcher.rs` / `runtime.rs` / `executor.rs`: only traits with one or two methods, zero implementation.
+- `behavior.rs` / `action.rs` / `state.rs` / `task.rs` / `encapsulator.rs` (`Envelope`) / `decapsulator.rs`: the types exist but are **not connected** to the send/receive path.
+- `derive/src/lib.rs`: `#[derive(Actor)]` assumes the commented-out `UnboundedMailbox::new(10)`, so using it now **fails to compile**.
+- `remote` / `cluster` / `persistence` / `streams`: crate scaffolding only.
 
-### 現状のメッセージ経路(動く1本)
+### The current message path (the one that works)
 ```
 ActorRef<T>          msg.clone()          receiver.lock()      receive()
-Arc<Mutex<T>>   ──▶  Arc<dyn Message> ──▶ .await 実行時ロック ──▶ println! だけ
-  共有+ロック          送信後も触れる         ロックフリーでない
-   (①の逆)             (②の逆)
+Arc<Mutex<T>>   ──▶  Arc<dyn Message> ──▶ .await runtime lock ──▶ println! only
+  shared+locked        touchable even         not lock-free
+   (inverse of ①)      after send (inverse of ②)
 ```
 
 ---
 
-## 3. 理論 ⇄ 実装 対比表
+## 3. Theory ⇄ implementation comparison table
 
-`design.md` の 4 本柱(①型による隔離 / ②コピーゼロの move / ③物理配置の一級化 / ④自前スケジューラ)を軸に。
+Organized around the four pillars of `design.md` (① isolation by types / ② zero-copy move / ③ physical placement as a first-class concern / ④ homegrown scheduler).
 
-| 観点 | 理論(design.md / Hewitt) | 旧実装(再構築前) | 判定 |
+| Aspect | Theory (design.md / Hewitt) | Old implementation (pre-rebuild) | Verdict |
 |---|---|---|---|
-| ①隔離の保証 | 型システムでコンパイル時保証(Pony caps) | `Arc<Mutex<T>>` 実行時ロック | ❌ 逆 |
-| ②メッセージ移動 | `move`=所有権移譲、送信後は触れない | `Arc<dyn Message>` を `clone()` 共有 | ❌ 逆 |
-| ③物理配置 | コアピン留め + コア内 SPSC mailbox | mailbox 実装コメントアウト・配置概念なし | ⛔ 未実装 |
-| ④スケジューラ | 自前・work-stealing 排除 | 素の `tokio::runtime::Runtime`(work-stealing) | ❌ 逆 |
-| メッセージ型 | (含意)typed / associated Message 型 | `dyn Message` 型消去(move 不能化の元凶) | ❌ 逆 |
-| Hewitt: state×msg→(state,msgs,behavior) | `Behavior` 型・`Action` enum で表現 | 型はあるが送受信経路と未接続 | ⛔ 未接続 |
-| Hewitt: become | `Action::Become` | enum のみ、実行機構なし | ⛔ 未実装 |
-| Hewitt: create | `Action::Create` / `Parent::spawn` | トレイトのみ、実体なし | ⛔ 未実装 |
-| ライフサイクル | preStart/postStop 等(Akka 由来) | 状態機械は完成、**未接続** | ⚠ 孤立 |
-| supervisor 階層 | akka-analyze で分析済み | `parent.rs` = 空トレイト 1 個 | ⛔ 未実装 |
+| ① Isolation guarantee | Compile-time guarantee via the type system (Pony caps) | `Arc<Mutex<T>>` runtime lock | ❌ inverse |
+| ② Message movement | `move` = ownership transfer, untouchable after send | shares `Arc<dyn Message>` via `clone()` | ❌ inverse |
+| ③ Physical placement | core pinning + in-core SPSC mailbox | mailbox impl commented out, no placement concept | ⛔ not implemented |
+| ④ Scheduler | homegrown, no work-stealing | plain `tokio::runtime::Runtime` (work-stealing) | ❌ inverse |
+| Message type | (implied) typed / associated Message type | `dyn Message` type erasure (the root of move-impossibility) | ❌ inverse |
+| Hewitt: state×msg→(state,msgs,behavior) | expressed via the `Behavior` type / `Action` enum | the types exist but are unwired from the send/receive path | ⛔ unwired |
+| Hewitt: become | `Action::Become` | enum only, no execution mechanism | ⛔ not implemented |
+| Hewitt: create | `Action::Create` / `Parent::spawn` | trait only, no substance | ⛔ not implemented |
+| Lifecycle | preStart/postStop etc. (from Akka) | the state machine is complete, but **unwired** | ⚠ orphaned |
+| Supervisor hierarchy | analyzed in akka-analyze | `parent.rs` = one empty trait | ⛔ not implemented |
 
-凡例: ❌=Thesis と逆方向 / ⛔=未実装 / ⚠=実装済みだが孤立(いずれも再構築前の状態)
+Legend: ❌ = opposite direction from the thesis / ⛔ = not implemented / ⚠ = implemented but orphaned (all reflect the pre-rebuild state)
 
-### 崩れの根本原因は一点
-**`dyn Message` による型消去が `move` を不可能にし、その代償で `Arc<Mutex>` の共有・ロックに逃げている。**
-ここが ①②③④ すべての崩れの震源。逆に言えば、ここを直すと 4 本柱が一直線に揃う。
+### The root cause of the collapse is a single point
+**Type erasure via `dyn Message` makes `move` impossible, and to pay for that it escapes into `Arc<Mutex>` sharing and locking.**
+This is the epicenter of every collapse across ①②③④. Conversely, fix this and the four pillars all line up in a straight line.
 
-**目指す経路(=再構築で実現した姿):**
+**The target path (= what the rebuild achieved):**
 ```
 Actor<M>            send(msg: M)         SPSC mailbox         &mut self
-associated 型 M ──▶ move で移譲     ──▶ コア内・lock-free ──▶ コアピン留め
-                    送信後 msg に触れると compile error(②を型で保証)
+associated type M ──▶ transfer via move ──▶ in-core, lock-free ──▶ core-pinned
+                    touching msg after send is a compile error (② guaranteed by types)
 ```
 
-鍵 = **型消去をやめる**:
-- `dyn Message`(型消去)→ move 不能 → Arc に頼る → 共有 → ①②が崩れる(旧実装)
-- actor ごとに associated `Message` 型を持たせ、mailbox を型付き SPSC に
-- すると `msg: M` を move で渡せる → Arc も Mutex も不要 → ①②③④が一直線に揃う
-- ＝ Pony の `iso`(一意・送信可)を Rust の「owned `T: Send` を move」で再現する、が土台
+The key = **stop erasing types**:
+- `dyn Message` (type erasure) → move impossible → lean on Arc → sharing → ①② collapse (old implementation)
+- give each actor an associated `Message` type, and make the mailbox a typed SPSC
+- then `msg: M` can be passed by move → no Arc, no Mutex needed → ①②③④ all line up in a straight line
+- = the foundation is reproducing Pony's `iso` (unique, sendable) as "move an owned `T: Send`" in Rust
 
 ---
 
-## 4. 決めた方向性 — 4 分岐の決着
+## 4. The chosen direction — settling the four forks
 
-頓挫の再発を防ぐため、着手前に以下 4 分岐を確定した。
+To prevent the stall from recurring, the following four forks were settled before starting work.
 
-### 分岐1: async/await に乗るか → **乗らない(B 案)**
-両立不可。震源はここ。
-- **A 案(却下): async 全面採用** — 楽だが work-stealing でコア間を跨ぎ、`.await` 越しにロックが要り、Thesis の「コア局所・ロックフリー・zero-copy」が原理的に成立しない。行き着く先は「Rust 版 Akka」= 既に kameo/ractor/xtra があり、**1 から作る意味が薄い**。
-- **B 案(採用): hot path から async を追放(Pony / LMAX / kompact 流)** — actor は `fn handle(&mut self, msg: M)` の **同期・run-to-completion**。コアにピン留めした OS スレッド上で、SPSC リングバッファの mailbox から取り出して回す自前スケジューラ。**Tokio は I/O の縁(ネットワーク等)にだけオプションで使う**。Thesis が本当に成立するのはこれだけ。
+### Fork 1: build on async/await? → **No (Option B)**
+The two are irreconcilable. This is the epicenter.
+- **Option A (rejected): go all-in on async** — easy, but work-stealing crosses cores, locks are needed across `.await`, and the thesis's "core-local, lock-free, zero-copy" cannot hold in principle. Where it ends up is "Rust's Akka" = kameo/ractor/xtra already exist, so **there is little point in building from scratch**.
+- **Option B (adopted): banish async from the hot path (Pony / LMAX / kompact style)** — an actor is a **synchronous, run-to-completion** `fn handle(&mut self, msg: M)`. On an OS thread pinned to a core, a homegrown scheduler pulls from an SPSC ring-buffer mailbox and spins. **Tokio is used, optionally, only at the I/O edge (networking, etc.).** This is the only way the thesis actually holds.
 
-### 分岐2: 何を作るか(ゴール) → **(b) 新規性のあるランタイム**
-- (a) 学習・研究 / **(b) 新規ランタイム(採用)** / (c) 実用ライブラリ
-- (b) を選ぶ以上、コア局所性・レイテンシで既存 Rust actor 群を上回ることが目標。数ヶ月級の systems project。
-- 過去の失敗は「(b) の理想を掲げ (c) の便利さを実装し (a) の厳密さが抜けた」混在状態。**混ぜない。**
+### Fork 2: what to build (the goal) → **(b) a runtime with novelty**
+- (a) learning/research / **(b) a novel runtime (adopted)** / (c) a practical library
+- Choosing (b) means the goal is to beat the existing Rust actor crates on core-locality and latency. A systems project on the order of months.
+- The past failure was a mixed state that "held up the ideals of (b), implemented the convenience of (c), and lost the rigor of (a)." **Do not mix them.**
 
-### 分岐3: スコープ → **v1 は単一ノード。分散/永続化/streams は凍結**
-- リモート/分散は zero-copy と矛盾(ネットワーク越し = serialize = コピー必須)。
-- `remote` / `cluster` / `persistence` / `streams` は **クレート枠だけ残して当面凍結**。捨てるのではなく将来の拡張面として後ろに送る。
+### Fork 3: scope → **v1 is single-node. Distribution / persistence / streams are frozen**
+- Remote/distributed contradicts zero-copy (over the network = serialize = copy required).
+- `remote` / `cluster` / `persistence` / `streams` **keep only their crate scaffolding and are frozen for now**. Not discarded, but pushed to the back as a future extension surface.
 
-### 分岐4: typed か dynamic か → **typed(分岐 1 で自動決定)**
-- B 案 = typed actor(associated Message 型)一択。move できて Arc も Mutex も不要になる。
-- typed の現実的コストは受容する:
-  - 1 つの actor が複数種類のメッセージを扱う → enum か複数チャネル
-  - 親が型の違う子を束ねる → `tag` 相当の型消去がどこかで必要
-  - これらは実装で必ずぶつかるので逃げずに設計する。
+### Fork 4: typed or dynamic → **typed (automatically decided by Fork 1)**
+- Option B = the single choice of a typed actor (associated Message type). It can move, and no Arc or Mutex is needed.
+- Accept the realistic costs of typed:
+  - one actor handling multiple message kinds → enum or multiple channels
+  - a parent bundling children of different types → a `tag`-equivalent type erasure is needed somewhere
+  - these will inevitably come up in the implementation, so design for them head-on instead of dodging.
 
-### 確定した姿(たたき台)
-> **ゴール (b)。B 案(async を core から追放)。v1 は単一ノード、分散/永続化/streams は凍結。typed actor。**
-> 最初のマイルストーンは極小に:**1 コアにピン留めした 1 スレッド + 1 つの typed actor + 1 本の SPSC mailbox + send は move + run-to-completion ループ。**
-> マルチコア・ルーティング・supervision は N=1 で Thesis が成立してから足す。
-
----
-
-## 5. 事業・ドメイン方面(本書の範囲外)
-
-本書は技術ロードマップに徹する。事業・ドメイン方面の検討は別途管理しており、この公開ドキュメントの
-範囲外とする。以下 §6 の技術進捗に続く。
+### The settled picture (working draft)
+> **Goal (b). Option B (banish async from core). v1 is single-node; distribution/persistence/streams are frozen. Typed actor.**
+> Make the first milestone tiny: **one thread pinned to one core + one typed actor + one SPSC mailbox + send by move + a run-to-completion loop.**
+> Multicore, routing, and supervision get added only after the thesis holds at N=1.
 
 ---
 
-## 6. 実装の進捗と次の技術ステップ
+## 5. Business and domain matters (out of scope here)
 
-### 着手ログ(方向が確定して実装したもの)
-1. **理論の詰め(B)** ✅ **完了(2026-07-03)** → `docs/pony-rust-capability-mapping.md`
-   - Pony の 6 capability(`iso`/`trn`/`ref`/`val`/`box`/`tag`)⇄ Rust の所有権・`Send`/`Sync` 対応表を作成。
-   - **go/no-go = go**: runtime に必要な `iso`/`val`/`tag`/`ref` は全て Rust に写り、核心の `iso`(move するメッセージ)は Pony より綺麗(構造的・静的に完全)。埋まらない差分(`trn`/`recover`/viewpoint adaptation)は critical path 外で non-goal。
-   - 導出された API 形: `trait Actor { type Message: Send; fn handle(&mut self, msg: Self::Message); }`(typed・move・同期 run-to-completion)。型消去(`dyn Message`)をやめれば ①②③④ が一直線に揃う、と確定。
-2. **検証実験(C)** ✅ **完了(2026-07-03)** → `experiments/capability-proof/`(親 workspace から detach した独立 crate)
-   - `cargo test` が 3 つの doctest + 2 つの実行時テストで理論を裏取り:
-     - **証明1(compile_fail)**: typed + move API で `send(order)` 後に `order` を使うと `E0382: borrow of moved value` で**コンパイル不能**。隔離を型が強制することを実証。
-     - **証明3(pass)**: Akka 流 `Arc<Mutex<_>>` は `tell(order.clone())` 後に `order.lock().qty = 200` が**素通りでコンパイル**。隔離が規約でしかないことを実証。
-   - **副産物の学び**: 検証には move した値を**実際に使う**必要がある。`let _ = order.qty;` の `let _ =` は「使用」とみなされず move を発火しないため、最初この罠で compile_fail が誤って通った。テストは `println!` 等で実使用すること(crate の doc に注記済み)。
-   - **メタ教訓**: パイプ後の `$?` は最後のコマンド(`head`)の終了コードで、`rustc` のものではない。コンパイル可否はパイプなしで exit を取る。
-3. **競合ランドスケープ調査(差別化ゲート下調べ)** ✅ **完了(2026-07-03)**
-   - **判定: 全敗ではないが空白でもない。** thread-per-core(glommio/Seastar)/ capability隔離(Pony)/ zero-copy move(Pony)/ fast typed Rust MP(kompact 400M msg/s)は**個別には全て既存**。差別化は**その組み合わせ**(Rust actor で thread-per-core+コアピン留め+型付きSPSC+capability隔離を丸ごと)にある。
-   - **design.md §2.3 の主張の生き残りは1点**: Pony に対する「物理配置(CPUトポロジ)一体化」。thread-per-core 自体は新規性なし。
-   - **勝ちが十分大きいかリスク**: thread-per-core の勝ち(tail latency 71〜92%改善)は既製 glommio でも得られる。→ 「速い actor」単体では glommio と kompact に挟まれる。**勝ち筋は 速さ×コンパイル時安全×actor抽象 の三点セット**。
-   - **Stage 0 ベンチの的が確定**: 軸=tail latency(p99/p9999)+jitter(throughput 一本は kompact に不利)。相手=①kameo/actix(楽勝ベースライン)②kompact(latencyで挑む)③glommio+薄actor(delta の本丸テスト)。手法=kompicsbenches 流用。
-   - 注: 検証パネルが session limit で全滅、数値はソース付きだが独立検証は未了。
-4. **N=1 の再構築(A)** ✅ **完了(2026-07-04)** → `core/`(package `aetherflow`、旧 core を置換)
-   - typed actor + move メッセージ + **有界 SPSC リングバッファ mailbox**(lock-free・head/tail を 64B 分離で false-sharing 回避)+ コアピン留め(best-effort)+ run-to-completion ループ(空時ビジースピン=LMAX 流)+ on_start/on_stop。
-   - `cargo test` 全緑(SPSC 6 + 統合 4 + doctest 2)、`cargo clippy` クリーン、デモ動作(16コア検出→コア0固定→注文 move 処理)。
-   - 隔離のコンパイル時保証(E0382)は capability-proof から引き継ぎ、doctest `compile_fail` で担保。
-   - **既知の制約**: コアピン留めは macOS では no-op(ハードアフィニティ無し)。実ピン留め+レイテンシ計測は Linux + Stage 0 で。
-5. **マルチコア化** ✅ **完了(2026-07-04)** → `core/`(System API に統一)
-   - **thread-per-core**(≠ thread-per-actor): `System::with_cores(N)` がコアごと 1 スレッド + ピン留め、各スレッドが多数の actor を run-to-completion で回す。actor はコア間を移動しない静的配置。
-   - **routing**: `ActorRef<A>` は clone 可能な MPSC 送信端。cross-core 送信は lock-free。同一コアの異種 actor は型消去(`dyn ErasedActor`)して 1 スレッドで回す(制御面=erased / データ面=typed)。
-   - **mailbox = 有界 MPSC**(Vyukov のスロット sequence、lock-free、64B 分離で false-sharing 回避)を新規実装。SPSC は単一生産者高速パス/将来のコア間ペアキュー用に温存。
-   - 検証: `cargo test` 全緑(spsc 6 + mpsc 5 + 統合 5 + doctest 2)、clippy クリーン、並行 MPSC・cross-core routing を release で各 20/20 反復パス、sharding デモ動作(gateway→3コアの engine)。
-   - 既知の制約: 静的配置のみ(work-stealing しない=偏り再分散は未着手)、同一コア handler 内の `send_blocking` はデッドロック注意(try_send を使う)、macOS ピン留め no-op。
-6. **Stage 0 ベンチ(勝負どころ)** 🔄 **予備測定 + AWS Tier1 実測済み** → `docs/stage0-bench-notes.md`、`core/benches/latency.rs`
-   - vs Tokio(work-stealing)で **中央値レイテンシ ~3.2倍・スループット ~3.9倍**(macOS/no-pin 予備)。倍数の勝ち=「十分大きいか」バーは予備的にクリア。
-   - **macOS では tail(p999)は同着**、max は跳ねる(ピン留め無しの予測どおり)。
-   - **Linux コンテナ実測(Docker on Mac, 4コア)**: median ~14倍・p99 ~8倍 aether 優位。ただし純 busy-spin は p999=2.6ms と tail 爆発(仮想化下の preempt)。
-   - **対策実装 `IdleStrategy::Backoff`**(spin→yield→park): p999 を 20倍改善(2.6ms→128µs、median +10% のみ)。**backoff は tokio/kameo を全分位で上回る**。既定は latency 優先 BusySpin、共有/仮想化は Backoff、と使い分け。
-   - **AWS Tier1 実測(実 Linux, 専有 vCPU)**: median ~10倍・ask ~40倍・throughput ~4.6倍、**tail が Docker の 2.5ms → 3.3µs に締まった**。看板は実ハードで証明済み。
-   - **残る本番(任意/後追い)**: 隔離コア bare-metal(Tier2)で絶対 tail を確定。AWS quota を待たず Latitude.sh/Vultr で撃てる(`docs/run-on-linux.md`)。Tier2 は公開の必須ゲートではなく ceiling-flex。
-   - **positioning(2026-07-04): cloud-first を主戦場に。** ベアメタル絶対 tail(HFT級)は狭いニッチの "天井 flex"。主戦場は「専有 vCPU のクラウドで Tokio/kameo に全分位圧勝、しかも backoff でアイドル CPU を焼かない、しかもコンパイル時安全」。詳細は `positioning.md`。
+This document stays strictly a technical roadmap. Business and domain considerations are managed separately and are out of scope for this public document. It continues into the technical progress in §6 below.
 
-### 進め方
-**B → C → A** の順で進めた。理論で土台を固め、最小例で裏取りし、それから core を作り直す。手戻り最小。
+---
 
-### 旧 core 退役 / リポジトリ整合化 ✅ 完了(2026-07-04)
-- 会話の発端だった「汚い状態」を解消。**新ランタイムを正式な `core/`(package `aetherflow`)に昇格**、
-  旧 `Arc<Mutex>` の Akka クローン(thesis と逆)を置換。
-- 旧 API 専用の `derive` / `macros` / `main-macro` crate を削除、root の死んだ scaffolding(examples/
-  tests/benches)も削除。detach していた `runtime/` を core に統合。
-- `remote` / `cluster` / `persistence` / `streams` は凍結 stub のまま workspace に残置(将来の拡張面)。
-- `cargo test --workspace` 全緑・clippy クリーン。**workspace が1つの coherent なビルドに回復**。
+## 6. Implementation progress and the next technical steps
 
-## 6.6 GPT 外部レビューの取り込み(2026-07-04)
+### Work log (things implemented once the direction was settled)
+1. **Nailing down the theory (B)** ✅ **Done (2026-07-03)** → `docs/pony-rust-capability-mapping.md`
+   - Built a mapping table of Pony's 6 capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`) ⇄ Rust's ownership, `Send`/`Sync`.
+   - **go/no-go = go**: the `iso`/`val`/`tag`/`ref` needed by the runtime all map onto Rust, and the core `iso` (a moved message) is cleaner than in Pony (structurally, statically complete). The gaps that cannot be filled (`trn`/`recover`/viewpoint adaptation) are off the critical path and non-goals.
+   - The derived API shape: `trait Actor { type Message: Send; fn handle(&mut self, msg: Self::Message); }` (typed, move, synchronous run-to-completion). Confirmed that dropping type erasure (`dyn Message`) makes ①②③④ line up in a straight line.
+2. **Verification experiment (C)** ✅ **Done (2026-07-03)** → `experiments/capability-proof/` (an independent crate detached from the parent workspace)
+   - `cargo test` backs the theory with 3 doctests + 2 runtime tests:
+     - **Proof 1 (compile_fail)**: with the typed + move API, using `order` after `send(order)` **fails to compile** with `E0382: borrow of moved value`. Demonstrates that the type enforces isolation.
+     - **Proof 3 (pass)**: the Akka-style `Arc<Mutex<_>>` **compiles cleanly** even when `order.lock().qty = 200` follows `tell(order.clone())`. Demonstrates that isolation is merely a convention.
+   - **Incidental learning**: the verification needs to **actually use** the moved value. `let _ = order.qty;` — the `let _ =` — is not counted as a "use" and does not fire the move, so at first this trap let compile_fail pass by mistake. Tests must actually use the value via `println!` etc. (noted in the crate's docs).
+   - **Meta-lesson**: `$?` after a pipe is the exit code of the last command (`head`), not of `rustc`. Take the exit status without a pipe to judge compilability.
+3. **Competitive landscape survey (groundwork for the differentiation gate)** ✅ **Done (2026-07-03)**
+   - **Verdict: not a total loss, but not empty space either.** thread-per-core (glommio/Seastar) / capability isolation (Pony) / zero-copy move (Pony) / fast typed Rust message passing (kompact, 400M msg/s) **all already exist individually**. The differentiation is in **their combination** (bringing thread-per-core + core-pinning + typed SPSC + capability isolation all together in a Rust actor).
+   - **Only one claim in design.md §2.3 survives**: "integration with physical placement (CPU topology)" against Pony. thread-per-core itself has no novelty.
+   - **Risk of whether the win is big enough**: the thread-per-core win (71–92% tail-latency improvement) is also obtainable with off-the-shelf glommio. → As a standalone "fast actor" it is squeezed between glommio and kompact. **The winning line is the three-piece set of speed × compile-time safety × actor abstraction.**
+   - **The Stage 0 benchmark target is fixed**: axis = tail latency (p99/p9999) + jitter (throughput alone is unfavorable against kompact). Opponents = ① kameo/actix (easy baseline), ② kompact (challenge on latency), ③ glommio + a thin actor (the real test of the delta). Method = reuse kompicsbenches.
+   - Note: the verification panel was wiped out by the session limit; the numbers are sourced but not yet independently verified.
+4. **N=1 rebuild (A)** ✅ **Done (2026-07-04)** → `core/` (package `aetherflow`, replacing the old core)
+   - typed actor + move messages + a **bounded SPSC ring-buffer mailbox** (lock-free, head/tail separated by 64B to avoid false sharing) + core pinning (best-effort) + a run-to-completion loop (busy-spin when empty = LMAX style) + on_start/on_stop.
+   - `cargo test` all green (SPSC 6 + integration 4 + doctest 2), `cargo clippy` clean, demo working (detect 16 cores → pin to core 0 → process an order by move).
+   - The compile-time isolation guarantee (E0382) is inherited from capability-proof and secured by a `compile_fail` doctest.
+   - **Known limitation**: core pinning is a no-op on macOS (no hard affinity). Real pinning + latency measurement to be done on Linux + Stage 0.
+5. **Going multicore** ✅ **Done (2026-07-04)** → `core/` (unified under the System API)
+   - **thread-per-core** (≠ thread-per-actor): `System::with_cores(N)` gives one thread + pinning per core, and each thread runs many actors in run-to-completion. Actors have a static placement and do not migrate across cores.
+   - **routing**: `ActorRef<A>` is a clonable MPSC sending end. Cross-core sends are lock-free. Heterogeneous actors on the same core are type-erased (`dyn ErasedActor`) and run on one thread (control plane = erased / data plane = typed).
+   - **mailbox = bounded MPSC** (Vyukov slot sequences, lock-free, separated by 64B to avoid false sharing), newly implemented. SPSC is kept for the single-producer fast path / a future cross-core paired queue.
+   - Verification: `cargo test` all green (spsc 6 + mpsc 5 + integration 5 + doctest 2), clippy clean, concurrent MPSC and cross-core routing pass 20/20 iterations each in release, sharding demo working (gateway → engines on 3 cores).
+   - Known limitations: static placement only (no work-stealing = skew rebalancing not yet started), `send_blocking` from within a same-core handler risks deadlock (use try_send), macOS pinning is a no-op.
+6. **Stage 0 benchmark (the decisive point)** 🔄 **Preliminary measurements + AWS Tier1 measured** → `docs/stage0-bench-notes.md`, `core/benches/latency.rs`
+   - vs Tokio (work-stealing): **~3.2× median latency, ~3.9× throughput** (macOS/no-pin, preliminary). A multiplicative win = the "is it big enough" bar is preliminarily cleared.
+   - **On macOS the tail (p999) ties**, and max spikes (as predicted without pinning).
+   - **Linux container measurement (Docker on Mac, 4 cores)**: ~14× median, ~8× p99 in aether's favor. However, pure busy-spin blows up the tail with p999 = 2.6ms (preemption under virtualization).
+   - **Countermeasure implemented: `IdleStrategy::Backoff`** (spin → yield → park): improves p999 by 20× (2.6ms → 128µs, median only +10%). **Backoff beats tokio/kameo across all quantiles.** The default is latency-first BusySpin; use Backoff for shared/virtualized environments, chosen per situation.
+   - **AWS Tier1 measurement (real Linux, dedicated vCPU)**: ~10× median, ~40× ask, ~4.6× throughput, and **the tail tightened from Docker's 2.5ms to 3.3µs**. The headline is proven on real hardware.
+   - **The remaining production run (optional / follow-up)**: fix the absolute tail on isolated-core bare metal (Tier2). It can be fired on Latitude.sh/Vultr without waiting for the AWS quota (`docs/run-on-linux.md`). Tier2 is not a mandatory gate for going public but a ceiling flex.
+   - **positioning (2026-07-04): cloud-first as the main battleground.** Bare-metal absolute tail (HFT class) is a narrow-niche "ceiling flex." The main battleground is "on dedicated-vCPU cloud, beat Tokio/kameo across every quantile, without burning idle CPU thanks to backoff, and compile-time safe on top of that." Details in `positioning.md`.
 
-外部レビュー(perf-first レンズ)を選別。**決着済みの分岐(work-stealing 排除・async 追放)や
-Tokio 互換を目標化する提案は退け**(thesis に反する。縁での相互運用=可・互換目標=否)、NUMA は
-v1 凍結維持。**拾ったもの**:
+### How we proceeded
+Proceeded in the order **B → C → A**. Solidify the foundation in theory, back it with a minimal example, then rebuild core. Minimal rework.
 
-- **Observability(最優先の新規)** 🔄 **第一弾実装済(2026-07-04)**: `ActorRef::mailbox_depth()` /
-  `total_sent()` / `total_processed()`。**hot path 追加コストゼロ** — 単一消費者の lock-free mailbox が
-  既に持つ enqueue/dequeue カウンタを露出するだけ(共有/work-stealing 系が競合 atomic を要するのと
-  対照的=モデルの帰結)。**processing-latency ヒストグラムも実装済(opt-in)**: `sys.build(..).instrumented().spawn()`
-  で有効化、`ActorRef::latency()` が p50/p99/p999/mean を返す。Instant のホットコストがあるので既定 OFF
-  (zero-overhead by default)。単一ライターゆえバケット更新は relaxed で競合なし。**残り**: cross-core
-  migration 数。これで以後の最適化が全部データ駆動になる。
-- ✅ **[実装済] SpawnBuilder(shallow surface の実践, 2026-07-04)**: 増えた `spawn_on_*` を
-  `sys.build(make).core(0).mailbox(4096).supervised().instrumented().spawn()` に整理。単純な場合は
-  `spawn_on` のまま、上級ノブだけ opt-in(progressive disclosure = §2.5・GPT #7)。`core/src/system.rs`。
-- ✅ **[実装済] デッドロックガード(type-justified safety 第3号, 2026-07-04)**: thread-local で
-  コアを識別し、handler 内から**同一コア**の actor へ `ask`/`send_blocking` する自己ブロックを検知。
-  **沈黙のハングを明確なエラー/panic に変える**(`ask` は `Err(WouldBlockCallingCore)`、`send_blocking`
-  は panic→パニック分離で捕捉)。footgun をランタイムが弾く。`core/src/system.rs` / `ask.rs`。
-- **cache-aware scheduler**: 現在の round-robin ポーリングは素朴。observability を付けてから
-  キャッシュ意識の順序付けへ(「一点突破三点セット」で唯一まだ甘い所)。
-- `#[actor]` derive はエルゴノミクス改善として保留(低優先)。
+### Retiring the old core / making the repository coherent ✅ Done (2026-07-04)
+- Resolved the "dirty state" that started the conversation. **Promoted the new runtime to the official `core/` (package `aetherflow`)**,
+  replacing the old `Arc<Mutex>` Akka clone (which was the inverse of the thesis).
+- Deleted the old-API-only `derive` / `macros` / `main-macro` crates, and the dead scaffolding at the root (examples/tests/benches) too. Integrated the detached `runtime/` into core.
+- `remote` / `cluster` / `persistence` / `streams` remain in the workspace as frozen stubs (a future extension surface).
+- `cargo test --workspace` all green, clippy clean. **The workspace is restored to a single coherent build.**
 
-### リスク register: 同一コア内 head-of-line blocking(GPT が見落とした最鋭リスク)
-thread-per-core は「1 コア = 1 スレッドが多数 actor を run-to-completion」ゆえ、**1 つの handle が
-長い/重いと同じコアの全 actor が待たされる**(work-stealing なら逃がせるが静的配置は逃げ場なし)。
-= thread-per-core の構造的弱点、"fairness vs locality" の我々版。緩和候補: per-message 時間予算、
-協調 yield、重い actor の隔離配置/専用コア。Stage 0 の後に実測で顕在化するはず。設計課題として登録。
+## 6.6 Incorporating the GPT external review (2026-07-04)
 
-## 7. 関連文書
-- `concepts-explained.md` — 概念のやさしい解説(用語集)。カプや CPU 概念を日常のたとえで。腹落ちの原点。
-- `design.md` — 技術的 Thesis(4 本柱)と先行研究(Pony / LMAX / work-stealing)
-- `positioning.md` — 4象限マトリクス + 総合力(公開ピッチ)
-- `stage0-bench-notes.md` — ベンチ実測(macOS / Docker / AWS Tier1)
-- `pony-rust-capability-mapping.md` — Pony caps ⇄ Rust 所有権の対応表(§6 着手 1、作成済み)
-- `actor-model-theoretical-concepts.md` — Hewitt actor モデルの形式化
-- `akka-analyze.md` — Akka 内部構造の詳細分析(ActorRef→mailbox→Dispatcher、Supervisor 階層、LifeCycle)
+Triaged an external review (a perf-first lens). **Rejected proposals that reopen already-settled forks (removing work-stealing, banishing async) or that make Tokio compatibility a goal** (these run counter to the thesis; interop at the edge = OK, compatibility as a goal = No), and kept NUMA frozen for v1. **What we took**:
+
+- **Observability (the top-priority new item)** 🔄 **First installment implemented (2026-07-04)**: `ActorRef::mailbox_depth()` /
+  `total_sent()` / `total_processed()`. **Zero added cost on the hot path** — the single-consumer lock-free mailbox
+  already holds the enqueue/dequeue counters, and we simply expose them (in contrast to shared/work-stealing systems
+  that need contended atomics = a consequence of the model). **A processing-latency histogram is also implemented (opt-in)**: enable it with `sys.build(..).instrumented().spawn()`,
+  and `ActorRef::latency()` returns p50/p99/p999/mean. Because `Instant` has a hot cost, it is OFF by default
+  (zero-overhead by default). Being single-writer, bucket updates are relaxed and uncontended. **Remaining**: cross-core
+  migration count. With this, all subsequent optimization becomes data-driven.
+- ✅ **[implemented] SpawnBuilder (putting the shallow surface into practice, 2026-07-04)**: organized the proliferating `spawn_on_*` into
+  `sys.build(make).core(0).mailbox(4096).supervised().instrumented().spawn()`. In simple cases it stays as
+  `spawn_on`, with only the advanced knobs opt-in (progressive disclosure = §2.5 · GPT #7). `core/src/system.rs`.
+- ✅ **[implemented] Deadlock guard (type-justified safety No. 3, 2026-07-04)**: identifies the core with a thread-local
+  and detects self-blocking when a handler does `ask`/`send_blocking` to an actor on the **same core**.
+  **Turns a silent hang into an explicit error/panic** (`ask` returns `Err(WouldBlockCallingCore)`, `send_blocking`
+  panics → caught via panic isolation). The runtime rejects the footgun. `core/src/system.rs` / `ask.rs`.
+- **cache-aware scheduler**: the current round-robin polling is naïve. After adding observability, move to
+  cache-aware ordering (the one spot still weak in the "single-breakthrough three-piece set").
+- The `#[actor]` derive is deferred as an ergonomics improvement (low priority).
+
+### Risk register: same-core head-of-line blocking (the sharpest risk GPT missed)
+Because thread-per-core is "1 core = 1 thread running many actors run-to-completion," **if one handle is
+long/heavy, all actors on the same core are made to wait** (work-stealing could offload it, but static placement has no escape).
+= a structural weakness of thread-per-core, our version of "fairness vs locality." Mitigation candidates: a per-message time budget,
+cooperative yield, isolated placement / a dedicated core for heavy actors. It should surface in measurement after Stage 0. Registered as a design issue.
+
+## 7. Related documents
+- `concepts-explained.md` — a gentle explanation of the concepts (glossary). Capabilities and CPU concepts by everyday analogy. The origin of intuition.
+- `design.md` — the technical thesis (four pillars) and prior work (Pony / LMAX / work-stealing)
+- `positioning.md` — the four-quadrant matrix + overall strength (the public pitch)
+- `stage0-bench-notes.md` — benchmark measurements (macOS / Docker / AWS Tier1)
+- `pony-rust-capability-mapping.md` — the mapping table of Pony caps ⇄ Rust ownership (§6 work item 1, created)
+- `actor-model-theoretical-concepts.md` — a formalization of the Hewitt actor model
+- `akka-analyze.md` — a detailed analysis of Akka's internal structure (ActorRef → mailbox → Dispatcher, Supervisor hierarchy, LifeCycle)
