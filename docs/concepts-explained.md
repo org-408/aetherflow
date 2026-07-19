@@ -1,134 +1,137 @@
-# 概念のやさしい解説(用語集)
+# Concepts, Explained Gently (Glossary)
 
-> この文書の位置づけ: `pony-rust-capability-mapping.md` は理論として正確だが高尚で読みづらい。
-> 本書はその**噛み砕き版**。専門用語を一度捨て、日常のたとえで「意味・用途・メリデリ」を並べる。
-> 迷ったら**ここに戻る**ための原点。厳密な議論が要るときだけ capability-mapping を見ればよい。
+> 🌐 English | [日本語](concepts-explained.ja.md)
 
----
 
-## 0. まず一文で(これだけは覚える)
-
-> **「他人と共有しないデータだけを使えば、そのデータは1つのCPUコアに居座り続けられる。
-> 居座れるとキャッシュ(手元の速い記憶)が暖まったままで、速い。」**
-
-Pony のカプ理論(型で「共有しない」を強制)と、CPU の話(コアに固定して速くする)は、
-**同じことの表と裏**。型で共有を禁じる → 物理的にデータが動かない → 速い。
-逆に `Arc`(共有)やロックを使った瞬間、データがコア間を行き来してキャッシュが冷え、遅くなる。
+> Where this document fits: `pony-rust-capability-mapping.md` is theoretically accurate but lofty and hard to read.
+> This document is its **plain-language version**. It sets the jargon aside for a moment and lines up "meaning, use, pros and cons" using everyday analogies.
+> It's the home base to **come back to** whenever you get lost. Only reach for the capability-mapping doc when you need a rigorous argument.
 
 ---
 
-## 1. データの「触り方」6種類(Pony の reference capabilities)
+## 0. First, in One Sentence (if you remember nothing else)
 
-データを**「モノ」**だと思う。誰がそれを持てて・読めて・書けるか、のルールが6種類。
+> **"If you only use data that isn't shared with anyone else, that data can stay put on a single CPU core.
+> Staying put keeps the cache (the fast memory close at hand) warm, and warm is fast."**
 
-| カプ | 一言でいうと | 日常のたとえ | Rust では | 他人に渡せる? | 使い所 |
+Pony's capability theory (the type system enforces "not shared") and the CPU story (pin to a core to go fast) are
+**two sides of the same coin**. Forbid sharing with types → the data physically doesn't move → fast.
+Conversely, the moment you reach for `Arc` (sharing) or a lock, the data starts bouncing between cores, the cache goes cold, and things slow down.
+
+---
+
+## 1. Six Ways to "Handle" Data (Pony's reference capabilities)
+
+Think of data as a **"thing."** There are six sets of rules for who can hold it, read it, and write it.
+
+| Capability | In a word | Everyday analogy | In Rust | Can hand off? | Where it's used |
 |---|---|---|---|:--:|---|
-| `iso` | 唯一の原本を手渡し | 封筒の原本を渡す。**渡したら自分の手元には無い** | `owned T` を move | ✅ | **メッセージ本体** |
-| `val` | 皆が読める不変の掲示 | 石碑。誰でも読めるが**誰も書き換えられない** | `Arc<T: Sync>` | ✅ | 全員に配る設定など |
-| `ref` | 自室のホワイトボード | 自分は読み書きするが**部屋の外に出せない** | `&mut self`(自状態) | ❌ | **actor 自身の状態** |
-| `box` | 他人のボードを見るだけ | 覗いて読むが書けない | `&T` | ❌ | 読むだけの借用 |
-| `tag` | 電話番号だけ知ってる | 電話はかけられるが**中身は覗けない** | `ActorRef` | ✅ | actor への参照(送信用) |
-| `trn` | 自分だけ書ける下書き | 他人は読める。清書すると石碑(`val`)になる | 対応が弱い | ❌ | **今回は使わない** |
+| `iso` | Hand off the one and only original | Hand over the original of an envelope. **Once handed off, you no longer have it** | move an `owned T` | ✅ | **the message body** |
+| `val` | An immutable notice everyone can read | A stone monument. Anyone can read it, but **no one can rewrite it** | `Arc<T: Sync>` | ✅ | config distributed to everyone, etc. |
+| `ref` | The whiteboard in your own room | You read and write it yourself, but **it can't leave the room** | `&mut self` (own state) | ❌ | **the actor's own state** |
+| `box` | Just looking at someone else's board | You peek and read, but can't write | `&T` | ❌ | read-only borrow |
+| `tag` | You only know the phone number | You can make the call, but **you can't see the contents** | `ActorRef` | ✅ | a reference to an actor (for sending) |
+| `trn` | A draft only you can write | Others can read it. Once finalized, it becomes a stone monument (`val`) | weak correspondence | ❌ | **not used this time** |
 
-### メリ/デリの要点
-- `iso`(手渡し原本)= **速い・安全(共有しないから)**。デメリット= 渡したら自分は使えない(でもそれが狙い)。
-- `val`(石碑)= **何人でも同時に読めて安全**。デメリット= 一度作ったら書き換え不可。
-- `ref`(自室のボード)= **ロック無しで自由に書ける**。デメリット= 外に出せない(= actor の中だけ)。
-- `box`(他人のボードを見る)= 読むだけなら安全。デメリット= 書けない。
-- `tag`(電話番号)= **中身を知らなくても連絡できる**。デメリット= 中は読めない(でもそれで十分)。
-- `trn`(下書き)= 可変で組んでから不変に固められる。デメリット= Rust に綺麗な対応が無い → **退避**。
+### The key pros and cons
+- `iso` (the handed-off original) = **fast and safe (because it isn't shared)**. Downside: once you hand it off, you can't use it (but that's the whole point).
+- `val` (the stone monument) = **any number of readers at once, safely**. Downside: once created, it can't be rewritten.
+- `ref` (your own room's board) = **freely writable without locks**. Downside: it can't leave (i.e., stays inside the actor).
+- `box` (looking at someone else's board) = safe if you only read. Downside: you can't write.
+- `tag` (the phone number) = **you can reach out without knowing the contents**. Downside: you can't read what's inside (but that's enough).
+- `trn` (the draft) = you can assemble it mutably, then freeze it into an immutable form. Downside: Rust has no clean correspondence → **set aside**.
 
-### なぜ `iso`/`val`/`tag` だけ「渡せる(sendable)」のか
-データ競合は「**2人以上が同じ物に同時に書く**」から起きる。だから:
-- `iso` = 書き手を**常に1人**に絞る(渡したら手元に残らない)
-- `val` = **誰も書かない**(石碑)
-- `tag` = **中を触らせない**(電話番号)
+### Why only `iso`/`val`/`tag` are "sendable"
+Data races happen because **two or more parties write to the same thing at the same time**. So:
+- `iso` = always narrows the writers down to **exactly one** (once handed off, nothing remains with you)
+- `val` = **no one writes** (a stone monument)
+- `tag` = **no one is allowed to touch the inside** (a phone number)
 
-この3つは競合が起きようがない → ロック自体が要らない → だから actor 間で安全に渡せる。
-そして **Rust の型は「渡したらもう触れない」をコンパイル時に強制できる** = これを"規約"でなく"保証"にする。
+None of these three can possibly race → no locks are needed at all → which is why they can be safely handed between actors.
+And **Rust's type system can enforce "once handed off, you can't touch it anymore" at compile time** = turning this from a "convention" into a "guarantee."
 
 ```
-危険な形（Arc + Mutex／今の実装）:
-  actor A（コア0） ──書く──▶ 同じデータ ◀──書く── actor B（コア1）
-                          = データ競合。守るにはロック = 遅い
+The dangerous shape (Arc + Mutex / the current implementation):
+  actor A (core 0) ──writes──▶ same data ◀──writes── actor B (core 1)
+                          = a data race. Guarding it means a lock = slow
 
-安全な形:
-  iso = 手渡しの原本（書ける人は常に1人）
-  val = 石碑（誰も書かない）
-  tag = 電話番号（中を見ない）
+The safe shape:
+  iso = the handed-off original (the writer is always exactly one)
+  val = the stone monument (no one writes)
+  tag = the phone number (no one looks inside)
 ```
 
 ---
 
-## 2. CPU まわりの概念(「退避すべきCPU的概念」を含む)
+## 2. CPU-Level Concepts (including the "CPU concepts to set aside")
 
-CPU には**主記憶(RAM、遅い)**と**キャッシュ(コアのすぐ横、超速い)**がある。
-よく使うデータをキャッシュに置けるかが速度を決める。
+A CPU has **main memory (RAM, slow)** and a **cache (right next to the core, blazingly fast)**.
+Whether you can keep frequently used data in the cache is what decides your speed.
 
-| 概念 | 一言でいうと | 日常のたとえ | メリ | デリ/注意 |
+| Concept | In a word | Everyday analogy | Pro | Con / caveat |
 |---|---|---|---|---|
-| キャッシュ局所性 | 同じデータを同じコアで触り続けると速い | よく使う道具を**手元**に置く | 桁違いに速い | 局所性が崩れると台無し |
-| コアピン留め | actor を特定コアに固定する | 担当者を**固定席**に座らせる | キャッシュが暖まったまま | 負荷が偏ると遊ぶコアが出る |
-| work-stealing | 暇なスレッドが他人の仕事を奪う | 手空きの人が仕事を横取り | 負荷分散が上手い | actor がコア間を飛び**キャッシュが冷える** → **不採用** |
-| SPSC リングバッファ | 1人が書き1人が読む専用の行列 | **専用レジ**(並ぶのは1列) | ロック不要で最速 | 1対1限定(多対1は工夫要) |
-| NUMA | CPUソケットごとにメモリが分かれ、遠いと遅い | 別棟の倉庫。近い倉庫は速い | 大規模で効く | 遠いメモリが遅く複雑 → **v1では後回し** |
-| false sharing | 無関係データが同じキャッシュ行に相席し、無駄に無効化される | 相席で片方が立つと**両方立たされる** | (回避策=パディング) | 気づきにくい罠 → 最適化時に対処 |
+| Cache locality | Touching the same data on the same core over and over is fast | Keep your frequently used tools **within reach** | Orders of magnitude faster | Ruined the moment locality breaks down |
+| Core pinning | Fix an actor to a specific core | Give each person a **fixed seat** | The cache stays warm | If load is uneven, some cores sit idle |
+| work-stealing | An idle thread grabs work from others | A free hand snatches up work | Good at load balancing | actors fly between cores and **the cache goes cold** → **not adopted** |
+| SPSC ring buffer | A queue dedicated to one writer and one reader | A **dedicated checkout** (only one line forms) | Lock-free and fastest | Limited to one-to-one (many-to-one takes extra effort) |
+| NUMA | Memory is split per CPU socket; far memory is slow | A warehouse in another building. The near warehouse is fast | Pays off at large scale | Far memory is slow and complex → **deferred in v1** |
+| false sharing | Unrelated data shares the same cache line and gets needlessly invalidated | Two strangers share a table, and when one stands, **both are made to stand** | (workaround = padding) | An easy-to-miss trap → address it during optimization |
 
-### NUMA を詳しく（なぜ v1 で凍結か）
-**NUMA = Non-Uniform Memory Access。** 大きいサーバ(CPU ソケットが 2 個以上)だと、メモリが物理的に
-各ソケットにぶら下がる。あるコアが**自分のソケットのメモリ**を触ると速い、**別ソケットのメモリ**を
-触るとソケット間の配線(Intel UPI / AMD Infinity Fabric)経由で遅い。「どこから、どのメモリを」で
-速度が変わる=Non-Uniform。たとえ:2棟のオフィス、各棟に倉庫。自分の棟は速い、隣の棟は歩く。
+### NUMA in detail (why it's frozen for v1)
+**NUMA = Non-Uniform Memory Access.** On a large server (two or more CPU sockets), the memory physically
+hangs off each socket. When a core touches **the memory on its own socket** it's fast; when it touches **memory on another socket**,
+it goes through the inter-socket interconnect (Intel UPI / AMD Infinity Fabric) and is slow. Speed changes based on "which memory, from where"
+= Non-Uniform. Analogy: two office buildings, each with its own warehouse. Your building is fast, the next building is a walk.
 
-我々への意味: actor をソケット0のコアに固定したのに状態/mailbox のメモリがソケット1だと、毎回
-「隣の棟まで歩く」= キャッシュ局所性の勝ちが台無し。NUMA-aware = コアと同じソケットにメモリを確保。
+What it means for us: if you pin an actor to a core on socket 0 but its state / mailbox memory sits on socket 1, then every time
+it's "a walk to the next building" = the cache-locality win is undone. NUMA-aware = allocate memory on the same socket as the core.
 
-**凍結の理由:**
-1. **NUMA はマルチソケット大型サーバにしか無い。** シングルソケット機(開発機・小型クラウド・
-   ラップトップ・Intel-Mac)は NUMA ノード 1 個 = メモリ均一 = **no-op**。触るハードがまだ無い。
-2. v1 は単一ノード。単一ソケットの tail 勝ち(Stage 0)すら未証明。NUMA はその後の二次的効果。
-3. 機構が重い(トポロジ検出・ノード別アロケータ・配置ポリシー・cross-NUMA)。狙ってないハード向け。
-4. 「測ってから足す」規律。マルチソケット実ワークロードでボトルネックと出るまで作らない。
-→ **凍結=順番の問題であって放棄ではない。** 補足: 最近は Graviton/EPYC のように 1 ソケット多コアが
-増え、マルチソケットの必要性自体が減少(単一ソケットでも chiplet/sub-NUMA で薄く出るが二次的)。
+**Why it's frozen:**
+1. **NUMA only exists on multi-socket large servers.** Single-socket machines (dev boxes, small cloud instances,
+   laptops, Intel Macs) have a single NUMA node = uniform memory = **no-op**. We don't even have the hardware to touch yet.
+2. v1 is single-node. We haven't even proven the single-socket tail win (Stage 0). NUMA is a secondary effect that comes after that.
+3. The machinery is heavy (topology detection, per-node allocators, placement policy, cross-NUMA). All for hardware we aren't targeting.
+4. The "measure before you add" discipline. We don't build it until a real multi-socket workload shows it to be the bottleneck.
+→ **Frozen = a matter of ordering, not abandonment.** A note: lately, single-socket many-core parts like Graviton/EPYC are
+becoming more common, and the very need for multi-socket is shrinking (even on a single socket it shows up faintly via chiplet / sub-NUMA, but that's secondary).
 
-### なぜ共有をやめると速いのか
+### Why dropping sharing makes things fast
 ```
-採用しない（Arc 共有 + work-stealing）:
-  コア0(冷) ─奪われ移動→ コア1(冷) ─奪われ移動→ コア2(冷)
-  移動のたびに主記憶から取り直す → 毎回冷たいキャッシュ → 遅い
+Not adopted (Arc sharing + work-stealing):
+  core 0 (cold) ─stolen, moves→ core 1 (cold) ─stolen, moves→ core 2 (cold)
+  each move re-fetches from main memory → a cold cache every time → slow
 
-採用（move + コアピン留め）:
-  コア0(固定席) … actor がずっとここ … キャッシュ暖かい
-  SPSC メールボックスも同じコア内 → ロック不要 → 速い
+Adopted (move + core pinning):
+  core 0 (fixed seat) … the actor stays right here … cache warm
+  the SPSC mailbox is on the same core too → lock-free → fast
 ```
 
-**型の話 = 物理の話**: `iso`(共有しない)を型で強制 → データが動かない → コアに固定できる →
-キャッシュが暖まる。「隔離をコンパイル時に保証」＝「物理的な速さ」が同じことの表と裏、
-というのが design.md の主張の中身。
+**The type story = the physics story**: enforce `iso` (not shared) with the type system → the data doesn't move → it can be pinned to a core →
+the cache stays warm. "Guaranteeing isolation at compile time" and "physical speed" being two sides of the same coin
+is what the claim in design.md is really about.
 
 ---
 
-## 3. v1 で使うもの / 退避(後回し)するもの
+## 3. What v1 Uses / What Gets Set Aside (deferred)
 
-| | 型の概念 | CPU の概念 |
+| | Type concepts | CPU concepts |
 |---|---|---|
-| ✅ **v1 で使う** | `iso`(メッセージ)/ `val`(不変共有)/ `tag`(参照)/ `ref`(自状態) | キャッシュ局所性 / コアピン留め / SPSC リングバッファ |
-| ⏸ **退避(後回し・使わない)** | `trn` / `recover` / viewpoint adaptation | **work-stealing(採用しない)** / NUMA(多ノード時) / false sharing 対策(最適化時) |
+| ✅ **Used in v1** | `iso` (messages) / `val` (immutable sharing) / `tag` (references) / `ref` (own state) | cache locality / core pinning / SPSC ring buffer |
+| ⏸ **Set aside (deferred, not used)** | `trn` / `recover` / viewpoint adaptation | **work-stealing (not adopted)** / NUMA (when multi-node) / false sharing mitigation (during optimization) |
 
-### 退避の理由(ひとこと)
-- `trn` / `recover` / viewpoint adaptation = Pony の「オブジェクト内部の細かい共有」を扱う高級機能。
-  **メッセージをやり取りするだけの runtime には要らない**ので、今は忘れてよい。
-- **work-stealing = 意図的に不採用**。Tokio が速さのためにやる「actor をコア間で飛ばす」仕組みで、
-  まさにキャッシュを冷やす犯人。**これを捨てるのがこの設計の肝**。
-- NUMA / false sharing = 単一ノードで速さを測る段階(Stage 0)では出てこない。**後の最適化ネタ**。
+### Reasons for setting aside (in a sentence each)
+- `trn` / `recover` / viewpoint adaptation = Pony's advanced features for handling "fine-grained sharing inside an object."
+  **A runtime that just passes messages around doesn't need them**, so you can forget about them for now.
+- **work-stealing = deliberately not adopted**. It's the mechanism Tokio uses for speed — "flinging actors between cores" —
+  which is exactly the culprit that cools the cache. **Throwing this out is the heart of this design.**
+- NUMA / false sharing = they don't show up at the stage of measuring speed on a single node (Stage 0). **Later optimization topics.**
 
-→ 覚えるのは **「使う7個」だけ** で十分。capability-mapping の `trn`/`recover`/viewpoint の節は
-「Pony にはあるけど**うちは使わない**」という但し書きなので、読み飛ばしてよい。
+→ It's enough to remember just **the 7 we use**. The `trn`/`recover`/viewpoint sections in capability-mapping are
+footnotes saying "Pony has them, but **we don't use them**," so you can skip past them.
 
 ---
 
-## 4. 関連文書
-- `pony-rust-capability-mapping.md` — 本書の厳密版(理論の詰め)。正確さが要るときはこちら。
-- `design.md` — 技術的 Thesis(4 本柱)。§2.2 が Pony、§4 が最優先リスク。
-- `direction-and-roadmap.md` — 方向性と道筋。この用語集は「なぜこの設計か」を腹落ちさせるための原点。
+## 4. Related Documents
+- `pony-rust-capability-mapping.md` — the rigorous version of this document (the theoretical details). Go here when you need precision.
+- `design.md` — the technical thesis (the four pillars). §2.2 covers Pony, §4 covers the top-priority risks.
+- `direction-and-roadmap.md` — direction and the path forward. This glossary is the home base for making "why this design" click.
