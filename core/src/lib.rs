@@ -63,6 +63,7 @@ mod ask;
 mod metrics;
 mod mpsc;
 mod system;
+mod timer;
 
 pub mod pinning;
 
@@ -75,6 +76,7 @@ pub mod net;
 pub use ask::{AskError, Responder};
 pub use metrics::LatencySnapshot;
 pub use system::{ActorRef, IdleStrategy, RestartPolicy, SchedulingPolicy, SpawnBuilder, System};
+pub use timer::TimerHandle;
 
 /// Why a non-blocking `try_send` failed. Both variants **return the original message** so the caller
 /// can re-route, persist, or log it.

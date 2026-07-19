@@ -89,6 +89,22 @@ enum HubMsg { Subscribe(ActorRef<Subscriber>), Publish(String) }
 for sub in &self.subscribers { let _ = sub.try_send(text.clone()); }
 ```
 
+## 4.6 スケジューリング — `timers`(`send_after` / `send_every`)
+
+`ActorRef` はメッセージをスケジュールできる。`send_after` は遅延後に1回、`send_every` は周期的に
+発火し、`cancel` できる `TimerHandle` を返す。配信は非ブロッキング(best-effort)で、周期タイマは
+対象 actor が消えると自動停止する(handle を捨ててもリークしない)。
+
+```rust
+hb.send_after(Duration::from_millis(50), Msg::WarmupDone);        // 単発・投げっぱなし
+let ticker = hb.send_every(Duration::from_millis(30), || Msg::Tick); // 周期
+// ...
+ticker.cancel();                                                  // 周期タイマを止める
+```
+
+タイマは共有バックグラウンドスレッド1本で動く ── 「N ms ごとの tick」「遅延発火」向けで、
+サブマイクロ秒のスケジューリング用ではない。
+
 ## 5. tokio に埋める — `tokio_interop`(段階導入)
 
 既存の async I/O は tokio のまま、**状態と計算だけ** AetherFlow に載せる。規則は2つ:

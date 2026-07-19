@@ -92,6 +92,7 @@ let depth: u64 = book.ask(|reply| Query::Depth(reply))?;
 | [`sharded`](core/examples/sharded.rs) | コアへの fan-out(thread-per-core、ロック無し) |
 | [`supervision`](core/examples/supervision.rs) | panic 分離 + 自動 restart |
 | [`pubsub`](core/examples/pubsub.rs) | 一対多ブロードキャスト — `ActorRef` をメッセージで渡す |
+| [`timers`](core/examples/timers.rs) | 遅延 + 周期メッセージ(`send_after` / `send_every`) |
 | [`tokio_interop`](core/examples/tokio_interop.rs) | AetherFlow を Tokio アプリの state コアとして埋める |
 | [`echo_server`](core/examples/echo_server.rs) | I/O as messages — `async` 無しの TCP サーバ(`--features net`) |
 
