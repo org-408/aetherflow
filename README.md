@@ -169,7 +169,8 @@ them than have you discover them:
   two) because the search space explodes, so they prove the ordering discipline
   rather than the whole queue: `cargo test --lib --release -p aetherflow` with
   `RUSTFLAGS="--cfg aetherflow_loom"`. The `ask` / `ask_timeout` reply cell is
-  covered by Miri (including the late-reply drop path) but not yet Loom-modelled.
+  covered by both Loom (the reply/abandon handshake ordering) and Miri (the
+  late-reply drop path).
 - **`IdleStrategy::BusySpin` is the default** (100% CPU per core) — use
   `IdleStrategy::backoff()` on shared or battery-powered machines.
 
