@@ -18,6 +18,22 @@
 /// Steer the current thread toward a core, in the best form the OS allows.
 /// Returns true if some placement adjustment took effect.
 pub fn pin_current_thread_to(core: usize) -> bool {
+    // Miri cannot emulate the affinity/QoS syscalls and externs. Placement is a best-effort
+    // benchmark concern, irrelevant to correctness, so do nothing under Miri (to let the unsafe
+    // verification run).
+    #[cfg(miri)]
+    {
+        let _ = core;
+        return false;
+    }
+    #[cfg(not(miri))]
+    {
+        pin_current_thread_to_impl(core)
+    }
+}
+
+#[cfg(not(miri))]
+fn pin_current_thread_to_impl(core: usize) -> bool {
     // macOS: hard-pinning not possible. Request a QoS that steers toward the P cores.
     #[cfg(target_os = "macos")]
     let macos_qos = request_performance_qos();

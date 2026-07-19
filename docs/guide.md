@@ -52,6 +52,8 @@ let v: Option<i64> = kv.ask(|reply| Cmd::Get("apples".into(), reply)).unwrap(); 
 ```
 
 - `ask` puts the reply slot on the **caller's stack** → **zero heap allocation**.
+- To bound the wait, use `ask_timeout(dur, ..)` → `Err(AskError::Timeout)` if no reply arrives. It
+  holds the cell in an `Arc` (one allocation) so a late reply after the timeout is discarded safely.
 - `ask` blocks the calling thread, so call it **from outside the runtime** (main / an I/O thread).
   Calling it from inside a handler on the same core returns `Err(WouldBlockCallingCore)` instead of
   hanging silently.
@@ -114,7 +116,7 @@ let snap = tokio::task::spawn_blocking(move || m.ask(Cmd::Snapshot).unwrap()).aw
 |---|---|---|---|---|
 | `try_send` | no | returns `Err(Full(msg))` | no | async / hot path / handle backpressure yourself |
 | `send_blocking` | only when full | waits until space frees | no | simple fire-and-forget |
-| `ask` | until reply | — | yes | request-reply (from outside the runtime) |
+| `ask` / `ask_timeout` | until reply / timeout | — | yes | request-reply (from outside the runtime) |
 
 On failure the **original message is returned** (`err.into_message()`), so you can retry, persist, or
 log it.

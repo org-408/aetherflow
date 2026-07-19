@@ -48,6 +48,8 @@ let v: Option<i64> = kv.ask(|reply| Cmd::Get("apples".into(), reply)).unwrap(); 
 ```
 
 - `ask` は reply スロットを**呼び出しスタック**に置く → **ヒープ確保ゼロ**。
+- 上限を付けるなら `ask_timeout(dur, ..)` → 返事が来なければ `Err(AskError::Timeout)`。cell を `Arc`
+  で持つ(確保1個)ので、timeout 後の遅延返信も安全に破棄される。
 - `ask` は呼び出しスレッドをブロックするので **runtime の外(main / I/O スレッド)から**呼ぶ。
   同一コアの handler 内から呼ぶと `Err(WouldBlockCallingCore)` で弾かれる(サイレントハングにしない)。
 
@@ -107,7 +109,7 @@ let snap = tokio::task::spawn_blocking(move || m.ask(Cmd::Snapshot).unwrap()).aw
 |---|---|---|---|---|
 | `try_send` | しない | `Err(Full(msg))` を返す | なし | async / ホットパス / backpressure を自分で捌く |
 | `send_blocking` | 満杯時のみ待つ | 空くまで待つ | なし | 単純な fire-and-forget |
-| `ask` | 返事まで待つ | — | あり | request-reply(runtime の外から) |
+| `ask` / `ask_timeout` | 返事/timeout まで | — | あり | request-reply(runtime の外から) |
 
 失敗は**元のメッセージを返す**(`err.into_message()`)ので、再送・永続化・ログに使える。
 
