@@ -156,17 +156,19 @@ them than have you discover them:
   shared internals — a message can still carry `Arc<Mutex<_>>` if you write it that
   way. This is ownership *transfer*, not Pony-`iso`-strength deep uniqueness.
 - **`ask` liveness depends on the callee replying.** If the actor is already gone
-  when you `ask`, you get `Err(AskError::Closed)`. But the reply cell lives on the
-  caller's stack, so if an actor *stores* the `Responder` instead of replying, the
-  caller blocks. Generation-tagged reply slots are on the roadmap.
+  when you `ask`, you get `Err(AskError::Closed)`. The reply cell lives on the
+  caller's stack, so if an actor *stores* the `Responder` instead of replying, `ask`
+  blocks — use **`ask_timeout(dur, ..)`** for a bounded wait (it holds the cell in an
+  `Arc` so a late reply after the timeout is discarded safely; Miri-verified for the
+  use-after-free / double-drop path).
 - **Lock-free queue verification.** The MPSC mailbox and the SPSC ring are checked
   by Loom, which explores every legal thread interleaving of small models rather
   than whichever one the hardware happened to produce; Miri covers UB on the
   unsafe paths. The models are deliberately tiny (two threads, capacity of one or
   two) because the search space explodes, so they prove the ordering discipline
   rather than the whole queue: `cargo test --lib --release -p aetherflow` with
-  `RUSTFLAGS="--cfg aetherflow_loom"`. The `ask` reply cell is not yet modelled —
-  it is being redesigned (see the liveness limitation above).
+  `RUSTFLAGS="--cfg aetherflow_loom"`. The `ask` / `ask_timeout` reply cell is
+  covered by Miri (including the late-reply drop path) but not yet Loom-modelled.
 - **`IdleStrategy::BusySpin` is the default** (100% CPU per core) — use
   `IdleStrategy::backoff()` on shared or battery-powered machines.
 

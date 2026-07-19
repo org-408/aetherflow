@@ -1,35 +1,45 @@
-//! Zero-allocation request-reply (`ask`).
+//! Zero-allocation request-reply (`ask`), plus bounded-wait [`ActorRef::ask_timeout`].
 //!
 //! The `ask` in kameo/tokio **heap-allocates a reply channel (oneshot) on every
 //! call**. That is the hidden cost of `ask`, and one reason `ask` through a
 //! framework is slow.
 //!
-//! This implementation places the reply cell on the **caller's stack** and hands
-//! it to [`Responder`] as a raw pointer. The caller blocks until the reply
-//! arrives, so **the cell is guaranteed to stay alive for the duration of the
-//! block** → zero heap allocation. The raw pointer is needed because the message
-//! (`A::Message: Send + 'static`) cannot carry a borrow. Safety is upheld by the
-//! protocol that "the caller blocks and keeps the cell alive."
+//! [`ActorRef::ask`] places the reply cell on the **caller's stack** and hands it
+//! to [`Responder`] as a raw pointer. The caller blocks until the reply arrives, so
+//! **the cell is guaranteed to stay alive for the duration of the block** → zero
+//! heap allocation. Safety is upheld by the protocol that "the caller blocks and
+//! keeps the cell alive."
+//!
+//! [`ActorRef::ask_timeout`] bounds the wait. But if the caller returns on timeout,
+//! its stack cell disappears, so an actor replying late would write to freed memory
+//! (a use-after-free). To avoid that, **only the timeout path holds the cell in an
+//! [`Arc`]** (one heap allocation); whichever side is last (caller or actor) frees
+//! it. The fast path ([`ActorRef::ask`]) stays zero-alloc.
 //!
 //! [`Responder`] is a **linear token that can reply exactly once** (`reply`
 //! consumes self) = iso-like. If it is dropped without replying, the caller wakes
 //! up with [`AskError::NoReply`] (no deadlock).
 //!
-//! **Constraint**: `ask` blocks the calling thread. **Asking an actor on the same
-//! core from within a handler deadlocks** (same as `send_blocking`). Use it from
-//! outside the runtime (the main / I/O threads).
+//! **Constraint**: both block the calling thread. **Asking an actor on the same
+//! core from within a handler would deadlock**, so that situation is rejected with
+//! [`AskError::WouldBlockCallingCore`].
 
 use crate::{Actor, ActorRef, SendError};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PENDING: u8 = 0;
 const REPLIED: u8 = 1;
 const ABANDONED: u8 = 2;
+// The caller has read REPLIED and moved the value out. A guard so the cell's Drop
+// does not drop the value a second time (relevant mainly to the timeout Arc cell).
+const CONSUMED: u8 = 3;
 
-/// Reply slot placed on the caller's stack. The actor writes it, the caller reads it.
+/// Reply slot. The actor writes it, the caller reads it. On the stack for `ask`,
+/// in an [`Arc`] for `ask_timeout`.
 struct ReplyCell<R> {
     state: AtomicU8,
     slot: UnsafeCell<MaybeUninit<R>>,
@@ -44,9 +54,43 @@ impl<R> ReplyCell<R> {
     }
 }
 
+impl<R> Drop for ReplyCell<R> {
+    fn drop(&mut self) {
+        // Drop the value here only if it was written (REPLIED) but never read out.
+        // This is the timeout path's only occurrence: after the caller gives up and
+        // drops its Arc, the actor replies late and was the last Arc holder. There
+        // is no longer a recipient, so drop the written value (no leak, no UAF).
+        // The fast path (stack cell) transitions to CONSUMED on read, so it never gets here.
+        if *self.state.get_mut() == REPLIED {
+            // SAFETY: REPLIED = the slot is initialized. This cell owns it, and there is no other reader.
+            unsafe { (*self.slot.get()).assume_init_drop() };
+        }
+    }
+}
+
+// How the cell the Responder points to is held: the fast path borrows (raw pointer),
+// the timeout path shares ownership (Arc).
+enum Cell<R> {
+    /// `ask`: borrows the cell on the caller's stack; the caller blocks to keep it alive.
+    Borrowed(*const ReplyCell<R>),
+    /// `ask_timeout`: shared via Arc, so the cell survives even if the caller leaves on timeout.
+    Owned(Arc<ReplyCell<R>>),
+}
+
+impl<R> Cell<R> {
+    #[inline]
+    fn get(&self) -> &ReplyCell<R> {
+        match self {
+            // SAFETY(Borrowed): the caller is blocked, so the cell is alive (the fast-path invariant).
+            Cell::Borrowed(p) => unsafe { &**p },
+            Cell::Owned(a) => a,
+        }
+    }
+}
+
 /// Linear token that can reply exactly once (iso-like). `reply` consumes self.
 pub struct Responder<R> {
-    cell: *const ReplyCell<R>,
+    cell: Cell<R>,
 }
 
 // Access to the cell is synchronized to a single writer/reader via the state
@@ -56,32 +100,36 @@ unsafe impl<R: Send> Send for Responder<R> {}
 impl<R> Responder<R> {
     /// Reply (consumes the token).
     pub fn reply(self, value: R) {
-        // SAFETY: the caller blocks until it observes REPLIED with Acquire, so the cell is alive.
-        unsafe {
-            (*(*self.cell).slot.get()).write(value);
-            // This Release store is the boundary that releases the caller. The cell
-            // must not be touched afterwards (the caller may return and free the
-            // cell (on the stack) = a use-after-free).
-            (*self.cell).state.store(REPLIED, Ordering::Release);
-        }
-        // Hence do not run Drop (the CAS to ABANDONED). Drop only performs the CAS
-        // when the token is dropped without replying.
+        // Take the cell out without running Drop (the ABANDONED-on-no-reply CAS).
+        // SAFETY: we forget self afterwards, so there is no double free.
+        let cell = unsafe { std::ptr::read(&self.cell) };
         std::mem::forget(self);
+
+        let cref = cell.get();
+        // SAFETY: the caller does not touch the slot until it reads the state with Acquire. This is the only writer.
+        unsafe { (*cref.slot.get()).write(value) };
+        // This Release store is the boundary that releases the caller. For Borrowed,
+        // touching the cell afterwards could race the caller returning and freeing the
+        // stack (UAF), so we finish using cref here.
+        cref.state.store(REPLIED, Ordering::Release);
+
+        // Drop the cell. Borrowed = a raw pointer, so this is a no-op (never touches the cell).
+        // Owned = drops one Arc. If the actor is the last holder (the caller already left on
+        // timeout), ReplyCell::Drop runs and discards the value that has nowhere to go.
+        drop(cell);
     }
 }
 
 impl<R> Drop for Responder<R> {
     fn drop(&mut self) {
-        // Only when dropped without replying, set ABANDONED to wake the caller with an Err.
-        // SAFETY: the caller keeps the cell alive by blocking.
-        unsafe {
-            let _ = (*self.cell).state.compare_exchange(
-                PENDING,
-                ABANDONED,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-        }
+        // Only when dropped without replying, set ABANDONED to wake a waiting caller with an Err.
+        // If the caller already left (timeout), the state may still be PENDING; the CAS may
+        // succeed but no one observes it, and the cell is reclaimed on the Arc's final drop (harmless).
+        let cref = self.cell.get();
+        let _ =
+            cref.state
+                .compare_exchange(PENDING, ABANDONED, Ordering::Release, Ordering::Relaxed);
+        // For Owned, the Arc is dropped by the normal drop of self.cell right after this.
     }
 }
 
@@ -96,6 +144,9 @@ pub enum AskError {
     /// Asked an actor on the **same core** from within a handler = a situation that would deadlock if it blocked.
     /// Returns this error instead of hanging. If a cross-actor response is needed, place it on a different core or design with tell.
     WouldBlockCallingCore,
+    /// [`ActorRef::ask_timeout`] did not receive a reply within the given time. The actor may still
+    /// reply later, but that reply is discarded (the caller has already left).
+    Timeout,
 }
 
 impl<A: Actor> ActorRef<A> {
@@ -105,47 +156,111 @@ impl<A: Actor> ActorRef<A> {
     /// Example: `let r: u64 = addr.ask(|resp| MyMsg::Get(resp))?;`
     ///
     /// **Note**: blocks the calling thread. Do not ask the same core from within a handler (deadlock).
+    /// If the actor holds the [`Responder`] without replying, this **never returns**. To bound the
+    /// wait, use [`ask_timeout`](Self::ask_timeout).
     pub fn ask<R>(&self, make_msg: impl FnOnce(Responder<R>) -> A::Message) -> Result<R, AskError>
     where
         R: Send + 'static,
     {
-        // Deadlock guard: asking from within a handler on the same core would hang,
-        // so return an error instead of hanging (unlike send_blocking, ask can return a Result).
         if self.would_deadlock_calling_core() {
             return Err(AskError::WouldBlockCallingCore);
         }
         let cell = ReplyCell::<R>::new();
-        let responder = Responder { cell: &cell };
+        let responder = Responder {
+            cell: Cell::Borrowed(&cell),
+        };
         let msg = make_msg(responder);
-        // If the actor is already gone at send time, Closed (NoReply is when there is no reply after sending).
-        // Bailing out here also prevents any deferred write into the ReplyCell (on the stack).
         if let Err(SendError::Closed(_)) = self.send_blocking(msg) {
             return Err(AskError::Closed);
         }
 
-        // Wait for the reply (spin → yield → short sleep backoff. Blocking, but does not keep burning CPU).
         let mut waited: u32 = 0;
         loop {
             match cell.state.load(Ordering::Acquire) {
                 REPLIED => {
                     // SAFETY: observing REPLIED = the actor's write (Release) is visible. Move out exactly once.
                     let value = unsafe { (*cell.slot.get()).assume_init_read() };
+                    // Record that it was moved out, so the stack cell's Drop does not double-drop.
+                    cell.state.store(CONSUMED, Ordering::Relaxed);
+                    return Ok(value);
+                }
+                ABANDONED => return Err(AskError::NoReply),
+                _ => backoff(&mut waited),
+            }
+        }
+    }
+
+    /// [`ask`](Self::ask) with an upper bound on the wait. Returns [`AskError::Timeout`] if no reply
+    /// arrives within `timeout`.
+    ///
+    /// Guarantees the caller **never blocks forever** in cases where an actor keeps the [`Responder`]
+    /// (a late reply, or a bug). Unlike the fast path [`ask`](Self::ask), it holds the reply cell in
+    /// an [`Arc`], so it costs **one heap allocation** (the necessary price so a late reply after the
+    /// timeout does not touch freed memory). If low latency with a guaranteed reply is the norm, use
+    /// [`ask`](Self::ask).
+    ///
+    /// If the actor replies after the timeout fires, that value is discarded (the caller has left).
+    pub fn ask_timeout<R>(
+        &self,
+        timeout: Duration,
+        make_msg: impl FnOnce(Responder<R>) -> A::Message,
+    ) -> Result<R, AskError>
+    where
+        R: Send + 'static,
+    {
+        if self.would_deadlock_calling_core() {
+            return Err(AskError::WouldBlockCallingCore);
+        }
+        let cell = Arc::new(ReplyCell::<R>::new());
+        let responder = Responder {
+            cell: Cell::Owned(Arc::clone(&cell)),
+        };
+        let msg = make_msg(responder);
+        if let Err(SendError::Closed(_)) = self.send_blocking(msg) {
+            return Err(AskError::Closed);
+        }
+
+        let deadline = Instant::now().checked_add(timeout);
+        let mut waited: u32 = 0;
+        loop {
+            match cell.state.load(Ordering::Acquire) {
+                REPLIED => {
+                    // SAFETY: observing REPLIED = the actor's write (Release) is visible. Move out exactly once.
+                    let value = unsafe { (*cell.slot.get()).assume_init_read() };
+                    // Record that it was moved out, so the cell's (Arc) final Drop does not double-drop.
+                    cell.state.store(CONSUMED, Ordering::Relaxed);
                     return Ok(value);
                 }
                 ABANDONED => return Err(AskError::NoReply),
                 _ => {
-                    if waited < 256 {
-                        std::hint::spin_loop();
-                    } else if waited < 512 {
-                        std::thread::yield_now();
-                    } else {
-                        std::thread::sleep(Duration::from_micros(20));
+                    // Give up past the deadline. One Arc to the cell is dropped here, but if the
+                    // actor's Responder still holds one, the cell stays alive and the late reply is
+                    // discarded safely.
+                    let expired = match deadline {
+                        Some(d) => Instant::now() >= d,
+                        None => false, // timeout so large it overflows = effectively infinite
+                    };
+                    if expired {
+                        return Err(AskError::Timeout);
                     }
-                    waited = waited.saturating_add(1);
+                    backoff(&mut waited);
                 }
             }
         }
     }
+}
+
+/// Backoff: spin → yield → short sleep. Keeps a blocking wait from burning CPU.
+#[inline]
+fn backoff(waited: &mut u32) {
+    if *waited < 256 {
+        std::hint::spin_loop();
+    } else if *waited < 512 {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_micros(20));
+    }
+    *waited = waited.saturating_add(1);
 }
 
 // Excluded under loom builds, since the real runtime (= loom types) cannot run outside the model.
@@ -153,11 +268,11 @@ impl<A: Actor> ActorRef<A> {
 mod tests {
     use super::*;
     use crate::System;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn ask_returns_reply() {
         struct Doubler;
-        // Message = (input, reply token)
         struct Req(u64, Responder<u64>);
         impl Actor for Doubler {
             type Message = Req;
@@ -186,7 +301,7 @@ mod tests {
             }
         }
         let sys = System::with_cores(3);
-        let addr = sys.spawn_on(2, Echo); // a different core
+        let addr = sys.spawn_on(2, Echo);
         assert_eq!(addr.ask(|resp| resp).unwrap(), "pong");
         drop(addr);
         sys.shutdown();
@@ -197,13 +312,121 @@ mod tests {
         struct Rude;
         impl Actor for Rude {
             type Message = Responder<u64>;
-            fn handle(&mut self, _resp: Responder<u64>) {
-                // Drop without replying → the caller wakes up with NoReply
-            }
+            fn handle(&mut self, _resp: Responder<u64>) {}
         }
         let sys = System::with_cores(1);
         let addr = sys.spawn_on(0, Rude);
         assert_eq!(addr.ask(|resp| resp), Err(AskError::NoReply));
+        drop(addr);
+        sys.shutdown();
+    }
+
+    #[test]
+    fn ask_timeout_returns_reply_when_prompt() {
+        struct Doubler;
+        struct Req(u64, Responder<u64>);
+        impl Actor for Doubler {
+            type Message = Req;
+            fn handle(&mut self, req: Req) {
+                let Req(n, resp) = req;
+                resp.reply(n * 2);
+            }
+        }
+        let sys = System::with_cores(1);
+        let addr = sys.spawn_on(0, Doubler);
+        for n in 0..1000u64 {
+            let r = addr
+                .ask_timeout(Duration::from_secs(5), |resp| Req(n, resp))
+                .unwrap();
+            assert_eq!(r, n * 2);
+        }
+        drop(addr);
+        sys.shutdown();
+    }
+
+    #[test]
+    fn ask_timeout_fires_when_responder_is_held() {
+        // An actor that holds the Responder and never replies. The fast-path `ask` would block
+        // forever, but ask_timeout returns Timeout.
+        struct Hoarder {
+            held: Vec<Responder<u64>>,
+        }
+        impl Actor for Hoarder {
+            type Message = Responder<u64>;
+            fn handle(&mut self, resp: Responder<u64>) {
+                self.held.push(resp); // hold it, do not reply
+            }
+        }
+        let sys = System::with_cores(1);
+        let addr = sys.spawn_on(0, Hoarder { held: Vec::new() });
+        let t = Instant::now();
+        let r = addr.ask_timeout(Duration::from_millis(50), |resp| resp);
+        assert_eq!(r, Err(AskError::Timeout));
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        drop(addr);
+        sys.shutdown();
+    }
+
+    #[test]
+    fn ask_timeout_late_reply_is_dropped_without_uaf() {
+        // The actor replies late, after the timeout fires. The cell is an Arc, so there is no UAF,
+        // and the value with nowhere to go is dropped exactly once by the cell's Drop (no leak, no
+        // double drop).
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Tracked;
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct SlowThenReplies {
+            held: Vec<Responder<Tracked>>,
+        }
+        enum Msg {
+            Ask(Responder<Tracked>),
+            Flush,
+        }
+        impl Actor for SlowThenReplies {
+            type Message = Msg;
+            fn handle(&mut self, msg: Msg) {
+                match msg {
+                    Msg::Ask(resp) => self.held.push(resp),
+                    Msg::Flush => {
+                        for resp in self.held.drain(..) {
+                            resp.reply(Tracked); // a late reply after the timeout
+                        }
+                    }
+                }
+            }
+        }
+
+        let sys = System::with_cores(1);
+        let addr = sys.spawn_on(0, SlowThenReplies { held: Vec::new() });
+
+        // R = Tracked has no Debug/PartialEq, so match with matches!.
+        let r = addr.ask_timeout(Duration::from_millis(30), Msg::Ask);
+        assert!(matches!(r, Err(AskError::Timeout)));
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            0,
+            "not replied yet, so nothing is dropped"
+        );
+
+        // Now make it reply late. The value has nowhere to go, so the cell's Drop drops it exactly once.
+        assert!(addr.send_blocking(Msg::Flush).is_ok());
+
+        // Wait for Flush to be processed and the late reply's value to be dropped.
+        let t = Instant::now();
+        while DROPS.load(Ordering::SeqCst) == 0 && t.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            1,
+            "the late reply's value is dropped exactly once"
+        );
+
         drop(addr);
         sys.shutdown();
     }

@@ -4,6 +4,7 @@
 //!
 //! Key idea: `ask` puts the reply slot on the **caller's stack** → **zero heap allocation**
 //! (kameo/tokio allocate a fresh oneshot per call). This is speed unlocked by the ownership model.
+//! Need a bounded wait? `ask_timeout(dur, ..)` returns `Err(AskError::Timeout)` if no reply arrives.
 //!
 //! Note: `ask` blocks the calling thread, so call it from outside the runtime (main / an I/O thread).
 
